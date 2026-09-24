@@ -1,5 +1,6 @@
 import express from 'express';
 import { submissionsRouter } from './routes/submissions.js';
+import { getMetrics } from './controllers/metricsController.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { pool } from './db/pool.js';
 
@@ -15,6 +16,8 @@ app.get('/api/v1/health', async (req, res) => {
     res.status(503).json({ status: 'degraded', db: 'unreachable' });
   }
 });
+
+app.get('/api/v1/metrics', getMetrics);
 
 app.use('/api/v1', submissionsRouter);
 

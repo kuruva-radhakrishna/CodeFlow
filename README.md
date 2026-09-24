@@ -41,7 +41,9 @@ to the next — no numbers get claimed until they're actually measured under loa
 - [x] Phase 8 — worker concurrency (multiple jobs per process) + horizontal scaling (multiple
       processes) - correctness model unchanged: Postgres is still the only authority, Redis is
       still just work distribution
-- [ ] Phase 9 — observability + metrics (queue latency, execution latency, end-to-end)
+- [x] Phase 9 — observability + metrics (`GET /api/v1/metrics`: submission counts, queue-wait vs.
+      execution-time vs. end-to-end latency percentiles, execution outcome breakdown, live
+      per-worker throughput). Not a Prometheus exporter - a plain JSON snapshot, deliberately
 - [ ] Phase 10 — load testing (k6) at 5 / 10 / 20 workers, against infrastructure we control
       (not the public Judge0 instance - see note below)
 - [ ] Phase 11 — deployment + documentation
@@ -358,6 +360,66 @@ evidence of anything wrong in the application:
 That's a reasoned argument for correctness, not a live demonstration of this exact scenario - the
 honest position, and the one worth recording rather than papering over with a retried test that
 happened to look like it passed.
+
+### Observability
+
+```
+GET /api/v1/metrics
+```
+
+One JSON snapshot, computed from data the system already has - no new tracing infrastructure, no
+`trace_id`, because `submission_id` already IS the correlation key for one traceable unit of work
+(there's no multi-hop fan-out per request that would need anything more):
+
+- **`submissions`** - counts by status, total, and a `rateLimitedTotal` counter (the one exception
+  to "rejected requests leave zero trace" from Phase 6 - a cumulative counter purely for
+  observability, not admission logic, so it doesn't compromise that guarantee).
+- **`queue.depth`** - live Redis queue length.
+- **`latency`** - the diagnostic this phase exists for: **queue wait** (`started_at - queued_at`,
+  "how long did it sit waiting for a worker") separated from **worker processing time**
+  (`completed_at - started_at`, "how long did claiming through Judge0 actually take") separated
+  from **end-to-end** (`completed_at - created_at`, what the client actually experienced),
+  each as p50/p95(/p99), over the last 24h of `COMPLETED` submissions. This is exactly "is the
+  system slow because of the queue or because of Judge0?", answerable at a glance instead of
+  guessed at. One acknowledged simplification: for a submission that went through retries,
+  `started_at` reflects only the *last* attempt (queue-wait/processing aren't broken out per
+  attempt) - `end_to_end` still correctly captures the full user-facing latency including
+  retry/backoff time regardless, so the total-latency number is never wrong, only the
+  queue-vs-processing split for a retried job specifically.
+- **`executionOutcomes`** - breakdown by `execution_status` (ACCEPTED/RUNTIME_ERROR/...) and by
+  `failure_reason` (JUDGE0_5XX/INVALID_REQUEST/MAX_RETRIES_EXCEEDED/...).
+- **`workers`** - which worker processes are *currently alive*, with live claimed/completed/
+  failed/retried/discarded counts each. Workers publish their snapshot to a Redis hash with a
+  short TTL, refreshed on every publish - the same self-expiring pattern as the submission lease
+  (Phase 5): a crashed worker's entry simply stops being renewed and disappears within a bounded
+  window, no separate cleanup process needed.
+
+### Verified (2026-09-24): observability
+
+Tested against the real, messy dataset accumulated across this session's own testing (54+ rows
+spanning Phases 3-8), which turned out to be a genuinely useful stress test of its own:
+
+- `GET /api/v1/metrics` returned correctly shaped data against real Postgres + Redis on the first
+  try: `submissions.byStatus`, `queue.depth`, all three latency tiers with percentiles, outcome
+  breakdowns, worker list.
+- **The numbers immediately told a true, if initially surprising, story.** `queueWaitMs.p95` came
+  back around **623,000ms (~10 minutes)**. That's not a bug - it's Phase 6's idempotency test
+  submissions, created while deliberately testing admission-control logic with **no worker
+  running** (that's what kept Phase 6 at zero Judge0 cost), sitting `QUEUED` for real until Phase
+  7's worker eventually started and drained the backlog. Confirmed by looking up those exact
+  submission ids directly. This is the metrics endpoint doing its job correctly - surfacing a real
+  (if session-specific) cause of latency instead of hiding it - and it's worth stating plainly
+  rather than curating the dataset to make the numbers look better.
+- **A clean live sample, for contrast**: with a worker actually running, 2 fresh submissions showed
+  `queue_wait_ms` of **~260-280ms** and end-to-end of **~1.9-2.2s** (dominated by Judge0's own round
+  trip, not the queue) - exactly the "queue wait vs. Judge0 time" split this phase exists to make
+  visible, and a striking contrast against the historical p95.
+- **Live worker tracking confirmed end-to-end**: `workers.active` went from `0` (no worker running)
+  to `1` with real `claimed`/`completed` counts matching actual progress within one publish cycle
+  of starting a worker - the Redis-hash-with-TTL pattern works as designed.
+- 20 `COMPLETED` rows show `execution_status: null` ("unknown" in the breakdown) - these are Phase
+  3's stub-completion rows, written before Judge0 was wired up in Phase 4. Real historical data,
+  correctly surfaced, not a bug in this phase's aggregation query.
 
 ### Verified (2026-09-24): the queue survives a worker outage
 

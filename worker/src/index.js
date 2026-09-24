@@ -13,7 +13,7 @@ import { submitToJudge0, normalizeJudge0Result, isRetryableJudge0Error, judge0Fa
 import { recoverStaleJobs } from './reaper.js';
 import { promoteReadyRetries } from './retryScanner.js';
 import { decideOutcome, MAX_RETRIES } from './retryPolicy.js';
-import { createMetrics } from './metrics.js';
+import { createMetrics, publishSnapshot } from './metrics.js';
 
 // Shared connection for non-blocking commands (enqueue from the reaper/retry loops). Each
 // concurrency lane gets its OWN connection for dequeuing - BRPOP blocks the connection it's
@@ -202,7 +202,16 @@ async function retryLoop() {
 async function metricsLoop() {
   while (!shuttingDown) {
     await sleep(config.metricsLogIntervalSeconds * 1000);
-    console.log(`[${config.workerId}] metrics: ${JSON.stringify(metrics.snapshot())}`);
+    const snapshot = metrics.snapshot();
+    console.log(`[${config.workerId}] metrics: ${JSON.stringify(snapshot)}`);
+    try {
+      // TTL is a few publish intervals wide so normal jitter never expires a live worker's entry,
+      // while a crashed worker's entry still self-cleans within a bounded window - no separate
+      // cleanup process needed, same self-expiring pattern as the submission lease.
+      await publishSnapshot(redis, config.workerId, snapshot, config.metricsLogIntervalSeconds * 3);
+    } catch (err) {
+      console.error(`[${config.workerId}] failed to publish metrics snapshot:`, err.message);
+    }
   }
 }
 

@@ -1,5 +1,11 @@
 import { z } from 'zod';
-import { createSubmission, getSubmissionById, listSubmissionsForUser } from '../services/submissions.js';
+import {
+  createSubmission,
+  getSubmissionById,
+  listSubmissionsForUser,
+  IdempotencyConflictError,
+} from '../services/submissions.js';
+import { checkRateLimit } from '../services/rateLimiter.js';
 
 const createSubmissionSchema = z.object({
   userId: z.string().min(1),
@@ -11,6 +17,19 @@ const createSubmissionSchema = z.object({
 export async function postSubmission(req, res, next) {
   try {
     const body = createSubmissionSchema.parse(req.body);
+
+    // Rate limit first, before idempotency or any persistence - a rejected request must leave
+    // zero trace in Postgres or Redis. Not applied to worker-side lease recovery (the reaper
+    // never calls this endpoint; it talks to Postgres/Redis directly) - recovering an abandoned
+    // job is internal system work, not a new client submission.
+    const rateLimit = await checkRateLimit(body.userId);
+    if (!rateLimit.allowed) {
+      return res.status(429).json({
+        error: 'rate_limited',
+        message: `Exceeded ${rateLimit.limit} submissions/minute`,
+      });
+    }
+
     const idempotencyKey = req.get('Idempotency-Key') || undefined;
 
     const { submission, replayed } = await createSubmission({ ...body, idempotencyKey });
@@ -23,6 +42,9 @@ export async function postSubmission(req, res, next) {
   } catch (err) {
     if (err instanceof z.ZodError) {
       return res.status(400).json({ error: 'invalid_request', details: err.issues });
+    }
+    if (err instanceof IdempotencyConflictError) {
+      return res.status(409).json({ error: 'IDEMPOTENCY_KEY_REUSED', message: err.message });
     }
     next(err);
   }

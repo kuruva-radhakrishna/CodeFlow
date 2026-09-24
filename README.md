@@ -32,8 +32,10 @@ to the next — no numbers get claimed until they're actually measured under loa
 - [x] Phase 5 — job leases + heartbeats + a reaper, so an abandoned RUNNING job is always
       eventually recovered instead of getting stuck forever (deliberately before rate
       limiting/retries, so those solve a demonstrated problem instead of being added speculatively)
-- [ ] Phase 6 — rate limiting + idempotency hardening
-- [ ] Phase 7 — retries + worker failure recovery
+- [x] Phase 6 — rate limiting (Redis fixed-window) + idempotency hardening (DB constraint as the
+      race authority, not check-then-act; explicit rejection of key-reuse-with-different-payload)
+- [ ] Phase 7 — retries + backoff + dead-letter queue (distinct from Phase 5's crash recovery:
+      this is about deliberately retrying a job that legitimately failed, e.g. Judge0 5xx)
 - [ ] Phase 8 — worker concurrency + horizontal scaling
 - [ ] Phase 9 — observability + metrics (queue latency, execution latency, end-to-end)
 - [ ] Phase 10 — load testing (k6) at 5 / 10 / 20 workers, against infrastructure we control
@@ -178,6 +180,51 @@ before it was caught and stopped). This is a real, well-known distributed-system
 race - and it's exactly why the fix (a one-time forced expiry, not a systemically-too-short lease)
 matches how the reaper is actually meant to be tuned in production: the lease duration must always
 exceed the slowest legitimate operation it covers, with real margin.
+
+### Rate limiting and idempotency hardening
+
+Two gaps closed together, both about what happens *before* a submission becomes durable state:
+
+- **Rate limiting**: a Redis fixed-window counter (`codeflow:ratelimit:{userId}:{windowStart}`,
+  `INCR` + `EXPIRE`), checked first in `POST /submissions` - before idempotency, before any
+  Postgres or Redis write. A rejected request (`429`) leaves zero trace anywhere. Deliberately a
+  plain fixed-window counter, not a token bucket - explicit and easy to reason about now; smoothing
+  bursts with a token bucket is a real but separate upgrade for later, not a gap in this one.
+  Scoped per `userId` (there's no auth/API-key layer yet - see Phase 6 note below).
+- **Idempotency, race-safe**: the previous implementation was check-then-act (`SELECT` for an
+  existing key, `INSERT` if none) - correct sequentially, but two concurrent requests with the same
+  key could both pass the `SELECT` before either `INSERT`s, creating two rows. Fixed by treating the
+  existing unique index on `(user_id, idempotency_key)` as the actual authority: attempt the
+  `INSERT` directly, and if it fails with a unique-violation (Postgres `23505`), look up whoever won
+  the race and resolve against *their* row instead of erroring.
+- **Idempotency contract, precisely defined**: same key + same request -> replay (same
+  `submissionId`, `replayed: true`). Same key + a **different** request -> `409
+  IDEMPOTENCY_KEY_REUSED`, rejected outright - a client can't accidentally receive Program A's
+  result while believing it submitted Program B. This applies uniformly whether the reuse is
+  detected sequentially or as the loser of a concurrent race.
+- **Worker recovery is exempt by construction, not by a special case**: the reaper
+  (`worker/src/reaper.js`) talks to Postgres and Redis directly and never calls the API - there is
+  no code path connecting it to `checkRateLimit` at all. Confirmed by inspection rather than a live
+  test: `grep -r rateLimit worker/` returns nothing.
+
+### Verified (2026-09-24): rate limiting and idempotency under real concurrency
+
+All six of the plan's test cases, run against the live API (no worker/Judge0 needed for any of
+this - it's all admission-control logic, so zero Judge0 quota spent):
+
+| Test | Result |
+|---|---|
+| A - normal submission | `202`, `QUEUED`, unchanged from Phase 3-5 |
+| B - sequential replay (same key, same payload, twice) | Same `submissionId` both times; second call `200`/`replayed:true`; exactly 1 DB row, 1 Redis job |
+| C - **concurrent** replay (5 truly simultaneous requests, same key/payload) | All 5 returned the *same* `submissionId` - one `202` winner, four `200`/`replayed:true` losers, zero errors; exactly 1 DB row, 1 Redis job despite 5 racers |
+| D - key reuse, different payload (`source=A` then `source=B`, same key) | Second request: `409 IDEMPOTENCY_KEY_REUSED`; re-fetched the original afterward and confirmed `sourceCode` was still `print("A")` - untouched |
+| E - rate limit (10 requests against a 5/minute limit) | Exactly 5x `202`, 5x `429`, in order; DB row count for that user was exactly 5, not 10 |
+| F - recovery bypasses rate limiting | Confirmed architecturally: no code path exists from the reaper to the rate limiter |
+
+Test C is the one worth dwelling on: it's the exact race the plan called out as **not** provably
+safe from a check-then-act `SELECT`-then-`INSERT` pattern, and it was verified against Postgres
+for real, with genuinely concurrent requests (fired with shell `&`/`wait`, not sequential awaits) -
+not just reasoned about.
 
 ### Verified (2026-09-24): the queue survives a worker outage
 

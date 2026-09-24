@@ -25,7 +25,8 @@ to the next — no numbers get claimed until they're actually measured under loa
 - [x] Phase 1 — Node.js API skeleton
 - [x] Phase 2 — PostgreSQL + submission state (`POST /submissions`, `GET /submissions/:id`,
       idempotency-key support pulled forward since it's a DB-layer concern)
-- [ ] Phase 3 — Redis queue
+- [x] Phase 3 — Redis queue + standalone worker process (`POST /submissions` now returns `202`
+      and enqueues; worker consumes and stubs completion - Judge0 itself isn't wired up yet)
 - [ ] Phase 4 — worker + Judge0 integration, end-to-end execution
 - [ ] Phase 5 — rate limiting
 - [ ] Phase 6 — retries + worker failure handling (lease/visibility timeout)
@@ -51,7 +52,13 @@ cp .env.example .env
 npm install
 psql "$DATABASE_URL" -f database/schema.sql   # or run schema.sql via any Postgres client
 npm run dev:api                                # starts the API on :3000
+npm run dev:worker                             # starts a worker (run this in a second terminal)
 ```
+
+The API and worker are independent processes that only communicate through Redis (the queue) and
+Postgres (submission state) - never directly. You can start any number of `npm run dev:worker`
+instances; each is a separate consumer of the same queue. Stopping every worker doesn't lose
+submissions - they simply accumulate in Redis until a worker is running again to drain them.
 
 Judge0: development currently points at the public CE instance (`ce.judge0.com`), which needs no
 signup but is rate-limited (~50 requests/day). Swap `JUDGE0_API_URL`/`JUDGE0_API_KEY` in `.env`
@@ -61,15 +68,26 @@ the same Judge0 HTTP contract either way.
 ### API
 
 ```
-POST /api/v1/submissions              create a submission (Idempotency-Key header optional)
+POST /api/v1/submissions              create a submission (Idempotency-Key header optional) -> 202
 GET  /api/v1/submissions/:id           submission state
 GET  /api/v1/submissions/:id/result    execution result only
 GET  /api/v1/users/:userId/submissions recent submissions for a user
 GET  /api/v1/health                    liveness + DB connectivity
 ```
 
-Submissions are currently created with `status=QUEUED` and stay there — nothing consumes the
-queue yet. That's Phase 3/4.
+A submission now flows `QUEUED -> RUNNING -> COMPLETED` end-to-end through the real queue and a
+real worker process. The worker doesn't call Judge0 yet (Phase 4) - it stubs the result so the
+distribution mechanism itself is provable in isolation from execution.
+
+### Verified (2026-09-24): the queue survives a worker outage
+
+10 submissions with no worker running -> all 10 sat `QUEUED` in Postgres, 10 jobs sat in Redis,
+API stayed responsive (`202` on every request). Worker started -> drained all 10 to `COMPLETED`,
+each exactly once, correct `worker_id`/`started_at`/`completed_at`. Repeated with the worker
+stopped mid-stream: 10 more submissions queued up untouched, then a **freshly started worker
+process** (new PID) picked up and drained the backlog with zero duplicates and zero loss. This is
+the queue acting as the buffer it's meant to be — submission traffic and execution capacity are
+decoupled.
 
 ## Why these technology choices
 

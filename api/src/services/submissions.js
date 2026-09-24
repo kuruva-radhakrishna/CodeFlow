@@ -1,5 +1,7 @@
 import { nanoid } from 'nanoid';
+import { enqueueSubmission } from '@codeflow/queue';
 import { pool } from '../db/pool.js';
+import { redis } from '../queue/client.js';
 import { SubmissionStatus } from './submissionStatus.js';
 
 const ROW_TO_DTO_FIELDS = `
@@ -30,7 +32,7 @@ export async function createSubmission({ userId, languageId, sourceCode, stdin, 
     [id, idempotencyKey ?? null, userId, languageId, sourceCode, stdin ?? '', SubmissionStatus.QUEUED],
   );
 
-  // Phase 3 will push { submissionId: id } onto the Redis queue here.
+  await enqueueSubmission(redis, id);
 
   return { submission: result.rows[0], replayed: false };
 }

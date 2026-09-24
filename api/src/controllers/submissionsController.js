@@ -15,7 +15,7 @@ export async function postSubmission(req, res, next) {
 
     const { submission, replayed } = await createSubmission({ ...body, idempotencyKey });
 
-    res.status(replayed ? 200 : 201).json({
+    res.status(replayed ? 200 : 202).json({
       submissionId: submission.id,
       status: submission.status,
       replayed,

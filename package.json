@@ -5,7 +5,8 @@
   "description": "Distributed code execution platform built around Judge0 (async API + Redis queue + worker pool + PostgreSQL)",
   "workspaces": [
     "api",
-    "worker"
+    "worker",
+    "queue"
   ],
   "scripts": {
     "dev:api": "npm run dev -w api",

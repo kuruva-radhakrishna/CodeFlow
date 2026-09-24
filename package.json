@@ -1,0 +1,16 @@
+{
+  "name": "codeflow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Distributed code execution platform built around Judge0 (async API + Redis queue + worker pool + PostgreSQL)",
+  "workspaces": [
+    "api",
+    "worker"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w api",
+    "dev:worker": "npm run dev -w worker",
+    "db:up": "docker compose up -d postgres redis",
+    "db:down": "docker compose down"
+  }
+}

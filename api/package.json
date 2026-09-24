@@ -1,0 +1,19 @@
+{
+  "name": "codeflow-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "nanoid": "^5.0.9",
+    "pg": "^8.13.1",
+    "zod": "^3.24.1"
+  }
+}

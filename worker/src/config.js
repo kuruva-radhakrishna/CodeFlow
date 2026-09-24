@@ -15,6 +15,10 @@ function required(name) {
 export const config = {
   databaseUrl: required('DATABASE_URL'),
   redisUrl: required('REDIS_URL'),
+  judge0: {
+    apiUrl: required('JUDGE0_API_URL'),
+    apiKey: process.env.JUDGE0_API_KEY ?? '',
+  },
   workerId: `worker-${os.hostname()}-${process.pid}`,
   // How long each blocking dequeue waits before giving the shutdown flag a chance to run.
   pollTimeoutSeconds: 5,

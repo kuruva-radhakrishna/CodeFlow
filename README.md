@@ -27,13 +27,17 @@ to the next — no numbers get claimed until they're actually measured under loa
       idempotency-key support pulled forward since it's a DB-layer concern)
 - [x] Phase 3 — Redis queue + standalone worker process (`POST /submissions` now returns `202`
       and enqueues; worker consumes and stubs completion - Judge0 itself isn't wired up yet)
-- [ ] Phase 4 — worker + Judge0 integration, end-to-end execution
-- [ ] Phase 5 — rate limiting
-- [ ] Phase 6 — retries + worker failure handling (lease/visibility timeout)
-- [ ] Phase 7 — worker concurrency + horizontal scaling
-- [ ] Phase 8 — observability + metrics (queue latency, execution latency, end-to-end)
-- [ ] Phase 9 — load testing (k6) at 5 / 10 / 20 workers
-- [ ] Phase 10 — failure testing (Redis down, Postgres down, Judge0 timeout, worker crash)
+- [x] Phase 4 — worker + Judge0 integration, real end-to-end execution (accepted / compile error /
+      runtime error all verified against the live public instance)
+- [ ] Phase 5 — execution pipeline reliability (Judge0 timeout, Judge0 unavailable, worker killed
+      mid-execution - deliberately before rate limiting/retries, so those solve a demonstrated
+      problem instead of being added speculatively)
+- [ ] Phase 6 — rate limiting + idempotency hardening
+- [ ] Phase 7 — retries + worker failure recovery
+- [ ] Phase 8 — worker concurrency + horizontal scaling
+- [ ] Phase 9 — observability + metrics (queue latency, execution latency, end-to-end)
+- [ ] Phase 10 — load testing (k6) at 5 / 10 / 20 workers, against infrastructure we control
+      (not the public Judge0 instance - see note below)
 - [ ] Phase 11 — deployment + documentation
 - [ ] Phase 12 — benchmark writeup
 
@@ -61,9 +65,12 @@ instances; each is a separate consumer of the same queue. Stopping every worker 
 submissions - they simply accumulate in Redis until a worker is running again to drain them.
 
 Judge0: development currently points at the public CE instance (`ce.judge0.com`), which needs no
-signup but is rate-limited (~50 requests/day). Swap `JUDGE0_API_URL`/`JUDGE0_API_KEY` in `.env`
-for a RapidAPI key or a self-hosted instance later — the worker code (Phase 4) is written against
-the same Judge0 HTTP contract either way.
+signup but is rate-limited (~50 requests/day) - fine for validating correctness (a handful of
+submissions), not for load testing. Swap `JUDGE0_API_URL`/`JUDGE0_API_KEY` in `.env` for a
+RapidAPI key or a self-hosted instance later; the worker's Judge0 client (`worker/src/judge0/`) is
+written against the same HTTP contract either way, so the swap needs no code changes. Load testing
+(Phase 10) must run against infrastructure we control, or we'd be measuring Judge0's public
+service's rate limit instead of CodeFlow's own behavior.
 
 ### API
 
@@ -75,9 +82,44 @@ GET  /api/v1/users/:userId/submissions recent submissions for a user
 GET  /api/v1/health                    liveness + DB connectivity
 ```
 
-A submission now flows `QUEUED -> RUNNING -> COMPLETED` end-to-end through the real queue and a
-real worker process. The worker doesn't call Judge0 yet (Phase 4) - it stubs the result so the
-distribution mechanism itself is provable in isolation from execution.
+A submission now flows `QUEUED -> RUNNING -> COMPLETED` (or `FAILED`) end-to-end through the real
+queue, a real worker process, and real Judge0 execution.
+
+### Job status vs. execution status
+
+`status` and `execution_status` answer two different questions, and conflating them was something
+we deliberately avoided:
+
+- **`status`** (`QUEUED`/`RUNNING`/`COMPLETED`/`FAILED`/...) — did **our infrastructure**
+  successfully process this submission end-to-end?
+- **`execution_status`** (`ACCEPTED`/`COMPILATION_ERROR`/`RUNTIME_ERROR`/`TIME_LIMIT_EXCEEDED`/...)
+  — what did the **user's program** actually do?
+
+A submission with a bug in it (`raise Exception(...)`) is `status=COMPLETED`,
+`execution_status=RUNTIME_ERROR` — CodeFlow did its job correctly; the user's code is what failed.
+`status` only goes to `FAILED` when Judge0/the worker/the network couldn't produce a result at
+all — that's *our* problem, and it's what Phase 7's retry logic will act on. Judge0's own internal
+errors (`status.id=13`) are mapped to job-level `FAILED`, not to an `execution_status`, for the
+same reason.
+
+### Verified (2026-09-24): three real executions through the live Judge0 pipeline
+
+Submitted real code through the full API → Redis → worker → Judge0 → Postgres path against
+`ce.judge0.com`, covering the three cases that matter (Phase 4 is only "done" once all three work,
+not just the happy path):
+
+| Case | Result |
+|---|---|
+| `print("Hello from Judge0")` (Python) | `COMPLETED` / `ACCEPTED`, real stdout, `time=0.011s`, `memory=3300kb` |
+| Deliberately broken C++ (`int main() { this is not valid C++`) | `COMPLETED` / `COMPILATION_ERROR`, real GCC compiler output captured in `compile_output` |
+| `raise Exception("boom")` (Python) | `COMPLETED` / `RUNTIME_ERROR`, real Python traceback captured in `stderr` |
+
+Along the way, an actual infra-level bug surfaced and validated the status/execution_status split
+for real: the worker's first Judge0 request used `base64_encoded=false`, which Judge0 rejected
+with a 400 for the C++ test case ("cannot be converted to UTF-8"). That correctly produced
+`status=FAILED` with the real error in `error_message` — not a fabricated `execution_status`. Fixed
+by switching both directions (request and response) to base64 encoding, which is what Judge0 itself
+recommends to avoid this whole class of transport issue.
 
 ### Verified (2026-09-24): the queue survives a worker outage
 

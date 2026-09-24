@@ -12,6 +12,15 @@ CREATE TABLE IF NOT EXISTS submissions (
     status          TEXT NOT NULL DEFAULT 'QUEUED'
                     CHECK (status IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'RETRYING', 'CANCELLED')),
 
+    -- What the user's PROGRAM did, as distinct from whether OUR infrastructure succeeded.
+    -- A COMPLETED job can have execution_status=RUNTIME_ERROR (that's the user's bug, not ours);
+    -- status only goes FAILED when Judge0/the worker itself couldn't produce a result.
+    execution_status TEXT
+                    CHECK (execution_status IN (
+                        'ACCEPTED', 'WRONG_ANSWER', 'COMPILATION_ERROR', 'RUNTIME_ERROR',
+                        'TIME_LIMIT_EXCEEDED', 'MEMORY_LIMIT_EXCEEDED', 'OTHER'
+                    )),
+
     judge0_token    TEXT,
     stdout          TEXT,
     stderr          TEXT,

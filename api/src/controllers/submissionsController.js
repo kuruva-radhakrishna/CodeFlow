@@ -49,6 +49,7 @@ export async function getSubmissionResult(req, res, next) {
     res.json({
       submissionId: submission.id,
       status: submission.status,
+      executionStatus: submission.executionStatus,
       stdout: submission.stdout,
       stderr: submission.stderr,
       compileOutput: submission.compileOutput,

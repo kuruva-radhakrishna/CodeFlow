@@ -6,7 +6,8 @@ import { SubmissionStatus } from './submissionStatus.js';
 
 const ROW_TO_DTO_FIELDS = `
   id, idempotency_key AS "idempotencyKey", user_id AS "userId", language_id AS "languageId",
-  source_code AS "sourceCode", stdin, status, judge0_token AS "judge0Token",
+  source_code AS "sourceCode", stdin, status, execution_status AS "executionStatus",
+  judge0_token AS "judge0Token",
   stdout, stderr, compile_output AS "compileOutput",
   execution_time AS "executionTime", memory_used AS "memoryUsed",
   retry_count AS "retryCount", worker_id AS "workerId", error_message AS "errorMessage",

@@ -34,4 +34,13 @@ export const config = {
   // default since backoffs themselves are short (1s/2s/4s) - a slow scan would add needless
   // latency on top of the backoff we already decided on.
   retryScanIntervalSeconds: Number(process.env.RETRY_SCAN_INTERVAL_SECONDS ?? 1),
+  // How many jobs this single worker process handles concurrently. Each lane gets its own Redis
+  // connection (BRPOP is blocking per-connection, so lanes can't share one and stay concurrent).
+  // worker_id (the DB ownership identity) stays shared across all of a process's lanes - lanes
+  // are an in-process concurrency detail, not a distinct ownership identity; the atomic
+  // claim (WHERE status='QUEUED') already guarantees only one lane, in this process or any
+  // other, ever ends up owning a given row.
+  workerConcurrency: Number(process.env.WORKER_CONCURRENCY ?? 3),
+  // How often this worker logs a cumulative throughput/outcome summary.
+  metricsLogIntervalSeconds: Number(process.env.METRICS_LOG_INTERVAL_SECONDS ?? 15),
 };

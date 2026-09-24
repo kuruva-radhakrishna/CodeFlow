@@ -10,7 +10,9 @@ const ROW_TO_DTO_FIELDS = `
   judge0_token AS "judge0Token",
   stdout, stderr, compile_output AS "compileOutput",
   execution_time AS "executionTime", memory_used AS "memoryUsed",
-  retry_count AS "retryCount", worker_id AS "workerId", error_message AS "errorMessage",
+  retry_count AS "retryCount", attempt_count AS "attemptCount",
+  worker_id AS "workerId", error_message AS "errorMessage",
+  lease_until AS "leaseUntil", last_heartbeat_at AS "lastHeartbeatAt",
   created_at AS "createdAt", queued_at AS "queuedAt", started_at AS "startedAt", completed_at AS "completedAt"
 `;
 

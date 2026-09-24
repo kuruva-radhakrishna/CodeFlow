@@ -28,9 +28,18 @@ CREATE TABLE IF NOT EXISTS submissions (
     execution_time  NUMERIC,
     memory_used     INTEGER,
 
-    retry_count     INTEGER NOT NULL DEFAULT 0,
+    retry_count     INTEGER NOT NULL DEFAULT 0,  -- reserved for Phase 7's deliberate retry-after-failure policy
     worker_id       TEXT,
     error_message   TEXT,
+
+    -- Job lease: a RUNNING submission is only "alive" while lease_until is in the future. A
+    -- worker renews it (heartbeat) while genuinely working; a crashed worker just stops renewing
+    -- it, and the reaper (see worker/src/reaper.js) recovers the job once it expires - no worker
+    -- needs to notice its own death. attempt_count counts claims, including crash-recovery
+    -- reclaims (distinct from retry_count above, which is for Phase 7's retry-after-failure).
+    lease_until       TIMESTAMPTZ,
+    last_heartbeat_at TIMESTAMPTZ,
+    attempt_count     INTEGER NOT NULL DEFAULT 0,
 
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     queued_at       TIMESTAMPTZ,
@@ -46,3 +55,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS submissions_user_idempotency_key_idx
 CREATE INDEX IF NOT EXISTS submissions_user_id_idx ON submissions (user_id);
 CREATE INDEX IF NOT EXISTS submissions_status_idx ON submissions (status);
 CREATE INDEX IF NOT EXISTS submissions_created_at_idx ON submissions (created_at DESC);
+CREATE INDEX IF NOT EXISTS submissions_stale_lease_idx ON submissions (lease_until) WHERE status = 'RUNNING';

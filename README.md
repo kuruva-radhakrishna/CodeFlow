@@ -29,9 +29,9 @@ to the next — no numbers get claimed until they're actually measured under loa
       and enqueues; worker consumes and stubs completion - Judge0 itself isn't wired up yet)
 - [x] Phase 4 — worker + Judge0 integration, real end-to-end execution (accepted / compile error /
       runtime error all verified against the live public instance)
-- [ ] Phase 5 — execution pipeline reliability (Judge0 timeout, Judge0 unavailable, worker killed
-      mid-execution - deliberately before rate limiting/retries, so those solve a demonstrated
-      problem instead of being added speculatively)
+- [x] Phase 5 — job leases + heartbeats + a reaper, so an abandoned RUNNING job is always
+      eventually recovered instead of getting stuck forever (deliberately before rate
+      limiting/retries, so those solve a demonstrated problem instead of being added speculatively)
 - [ ] Phase 6 — rate limiting + idempotency hardening
 - [ ] Phase 7 — retries + worker failure recovery
 - [ ] Phase 8 — worker concurrency + horizontal scaling
@@ -120,6 +120,64 @@ with a 400 for the C++ test case ("cannot be converted to UTF-8"). That correctl
 `status=FAILED` with the real error in `error_message` — not a fabricated `execution_status`. Fixed
 by switching both directions (request and response) to base64 encoding, which is what Judge0 itself
 recommends to avoid this whole class of transport issue.
+
+### Job leases, heartbeats, and worker recovery
+
+Phase 4 left a real gap: if a worker dies between claiming a job and Judge0 responding, that
+submission stays `RUNNING` forever — nothing ever notices. Phase 5 closes it with a lease:
+
+- **Claim** grants a lease (`lease_until = now() + 15s` by default) and bumps `attempt_count`.
+- **Heartbeat**: while a worker is genuinely still working a job, it renews the lease every 5s
+  (`UPDATE ... WHERE status='RUNNING' AND worker_id=$ownWorkerId` — ownership-checked, so a worker
+  that's already lost the job can't accidentally resurrect its lease).
+- **Reaper**: every worker also runs a loop (no separate service - "we can initially implement
+  this inside the worker process," per the plan) that recovers any `RUNNING` row whose lease has
+  expired back to `QUEUED` and re-enqueues it in Redis. Any worker's reaper can recover any job,
+  including its own.
+- **Every write that ends a job is ownership-guarded**: `completeExecution` and `failSubmission`
+  both include `AND status='RUNNING' AND worker_id=$thisWorker` in their `WHERE` clause. If a
+  worker's Judge0 call finally resolves after it's lost ownership (recovered elsewhere), the write
+  silently affects zero rows and is discarded - it cannot clobber whatever the current owner wrote.
+
+**This means duplicate Judge0 execution is possible and is not prevented** - if a job is recovered
+while the original worker is still actually (if slowly) working it, both may submit to Judge0, and
+Judge0 will genuinely execute the code twice. The design goal is explicitly **at-least-once
+processing with idempotent, ownership-guarded state transitions**, not exactly-once execution -
+see [Test D](#verified-2026-09-24-worker-recovery-and-the-ownership-race) below, where this was
+deliberately reproduced and confirmed safe (no corruption, no lost/duplicated final state) rather
+than hidden.
+
+### Verified (2026-09-24): worker recovery and the ownership race
+
+**Test B - worker killed mid-execution.** Submitted a deliberately slow job (`time.sleep(9)`),
+confirmed it was claimed and `RUNNING` with a live lease, then force-killed the worker process at
+the OS level mid-Judge0-call. Confirmed the row stayed stuck `RUNNING` with an expired lease and no
+one to recover it - the exact gap this phase exists to close. Started a *fresh* worker process:
+its reaper recovered the stale job on its very first sweep, re-queued it, and the fresh worker
+claimed and completed it for real (`attempt_count: 1 -> 2`, `worker_id` switched to the new
+process). Redis queue and Postgres both ended clean - no stuck rows, no duplicate ids.
+
+**Test D - the ownership race.** To reproduce the race safely (see the mistake below), used two
+workers with default (full-length) leases and a one-time manual SQL statement to force-expire one
+job's lease immediately after claim - simulating "the reaper wrongly believes this worker is dead"
+without any risk of it recurring. Result: the reaper (on either worker) recovered the "stale" job
+while the original worker was still genuinely, correctly working it; a second worker claimed and
+completed it first; and when the *original* worker's Judge0 call eventually resolved too (a real,
+duplicate Judge0 execution of the same code), its completion write correctly affected zero rows
+and was discarded - logged as `DISCARDED - ownership was lost mid-flight`, not silently swallowed.
+Final state: exactly one `COMPLETED` row, correct final `worker_id`, `attempt_count: 2`, zero
+duplicate rows, zero corruption.
+
+**A mistake worth keeping in here rather than editing out.** The first attempt at forcing this race
+used a globally short lease (3s) with a long heartbeat interval on *both* workers, for *every*
+claim - not just the initial one. Since a recovered job's re-claim also got the same too-short
+lease, and the 10s Judge0 job never had a chance to finish within it, the job cycled through
+claim → reap → re-claim → reap indefinitely, firing a new real Judge0 request on every cycle (7
+before it was caught and stopped). This is a real, well-known distributed-systems failure mode -
+**a lease shorter than the operation it's meant to protect causes livelock**, not just a one-time
+race - and it's exactly why the fix (a one-time forced expiry, not a systemically-too-short lease)
+matches how the reaper is actually meant to be tuned in production: the lease duration must always
+exceed the slowest legitimate operation it covers, with real margin.
 
 ### Verified (2026-09-24): the queue survives a worker outage
 

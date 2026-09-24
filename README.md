@@ -23,10 +23,11 @@ to the next — no numbers get claimed until they're actually measured under loa
 
 - [x] Phase 0 — architecture + repo scaffold
 - [x] Phase 1 — Node.js API skeleton
-- [x] Phase 2 — PostgreSQL + submission state (`POST /submissions`, `GET /submissions/:id`)
+- [x] Phase 2 — PostgreSQL + submission state (`POST /submissions`, `GET /submissions/:id`,
+      idempotency-key support pulled forward since it's a DB-layer concern)
 - [ ] Phase 3 — Redis queue
 - [ ] Phase 4 — worker + Judge0 integration, end-to-end execution
-- [ ] Phase 5 — rate limiting + idempotency
+- [ ] Phase 5 — rate limiting
 - [ ] Phase 6 — retries + worker failure handling (lease/visibility timeout)
 - [ ] Phase 7 — worker concurrency + horizontal scaling
 - [ ] Phase 8 — observability + metrics (queue latency, execution latency, end-to-end)
@@ -37,13 +38,19 @@ to the next — no numbers get claimed until they're actually measured under loa
 
 ## Local development
 
-Prerequisites: Node.js 20+, Docker Desktop (for Postgres + Redis).
+Prerequisites: Node.js 20+.
+
+Postgres and Redis run as free cloud-hosted instances ([Neon](https://neon.tech) and
+[Upstash](https://upstash.com)) rather than via Docker — this dev machine has no admin rights, so
+Docker Desktop isn't an option. `docker-compose.yml` is kept in the repo for later (a machine that
+does have Docker, or the eventual deployment story) but isn't required for local dev today.
 
 ```bash
 cp .env.example .env
+# fill in DATABASE_URL (Neon) and REDIS_URL (Upstash) in .env
 npm install
-npm run db:up          # starts Postgres + Redis via docker-compose
-npm run dev:api         # starts the API on :3000
+psql "$DATABASE_URL" -f database/schema.sql   # or run schema.sql via any Postgres client
+npm run dev:api                                # starts the API on :3000
 ```
 
 Judge0: development currently points at the public CE instance (`ce.judge0.com`), which needs no

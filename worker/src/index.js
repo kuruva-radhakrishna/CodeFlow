@@ -7,9 +7,12 @@ import {
   getSubmissionForExecution,
   completeExecution,
   failSubmission,
+  scheduleRetry,
 } from './submissions.js';
-import { submitToJudge0, normalizeJudge0Result } from './judge0/index.js';
+import { submitToJudge0, normalizeJudge0Result, isRetryableJudge0Error, judge0FailureReason } from './judge0/index.js';
 import { recoverStaleJobs } from './reaper.js';
+import { promoteReadyRetries } from './retryScanner.js';
+import { decideOutcome, MAX_RETRIES } from './retryPolicy.js';
 
 const redis = createRedisClient(config.redisUrl);
 
@@ -27,6 +30,34 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Handles a Judge0-side failure (thrown error, or a successful-but-infra-failed response like
+// Judge0's own internal error). Decides RETRY vs permanent FAIL using retryPolicy, and writes the
+// outcome - ownership-guarded either way, so a worker that's lost the job can't clobber whoever
+// has it now.
+async function handleFailure(submissionId, retryCount, { retryable, failureReason, errorMessage }) {
+  const outcome = decideOutcome({ retryable, retryCount });
+
+  if (outcome.action === 'RETRY') {
+    const scheduled = await scheduleRetry(submissionId, config.workerId, {
+      failureReason,
+      errorMessage,
+      backoffSeconds: outcome.backoffSeconds,
+    });
+    if (scheduled) {
+      console.warn(
+        `[${config.workerId}] ${submissionId} RETRYING (attempt failed: ${failureReason}) - retry ${scheduled.retryCount}/${MAX_RETRIES} scheduled for ${scheduled.nextRetryAt.toISOString()}`,
+      );
+    } else {
+      console.warn(`[${config.workerId}] ${submissionId} failed but retry scheduling was discarded - no longer owned`);
+    }
+    return;
+  }
+
+  const finalReason = outcome.failureReasonOverride ?? failureReason;
+  const wrote = await failSubmission(submissionId, config.workerId, { failureReason: finalReason, errorMessage });
+  console.error(`[${config.workerId}] ${submissionId} FAILED permanently: ${finalReason}${wrote ? '' : ' (discarded - no longer owned)'}`);
+}
+
 async function processSubmission(submissionId) {
   const claimed = await claimSubmission(submissionId, config.workerId, config.leaseDurationSeconds);
   if (!claimed) {
@@ -36,17 +67,20 @@ async function processSubmission(submissionId) {
 
   const submission = await getSubmissionForExecution(submissionId);
   if (!submission) {
-    await failSubmission(submissionId, config.workerId, 'submission row disappeared after claim');
+    await failSubmission(submissionId, config.workerId, {
+      failureReason: 'ROW_MISSING',
+      errorMessage: 'submission row disappeared after claim',
+    });
     console.error(`[${config.workerId}] ${submissionId} FAILED: row missing after claim`);
     return;
   }
 
-  console.log(`[${config.workerId}] running ${submissionId} on Judge0`);
+  console.log(`[${config.workerId}] running ${submissionId} on Judge0 (retry_count=${submission.retryCount})`);
 
   // Heartbeat: keep renewing the lease for as long as we're genuinely still working the job.
   // If we ever lose ownership mid-flight (reaper recovered it, another worker took over), we
   // can't cancel the in-flight Judge0 request, but we log it immediately so it's visible - the
-  // eventual ownership-guarded write in completeExecution/failSubmission will correctly no-op.
+  // eventual ownership-guarded write below will correctly no-op.
   const heartbeat = setInterval(async () => {
     const stillOwned = await renewLease(submissionId, config.workerId, config.leaseDurationSeconds);
     if (!stillOwned) {
@@ -64,15 +98,23 @@ async function processSubmission(submissionId) {
     result = normalizeJudge0Result(raw);
   } catch (err) {
     clearInterval(heartbeat);
-    const wrote = await failSubmission(submissionId, config.workerId, err.message);
-    console.error(`[${config.workerId}] ${submissionId} FAILED: ${err.message}${wrote ? '' : ' (discarded - no longer owned)'}`);
+    await handleFailure(submissionId, submission.retryCount, {
+      retryable: isRetryableJudge0Error(err),
+      failureReason: judge0FailureReason(err),
+      errorMessage: err.message,
+    });
     return;
   }
   clearInterval(heartbeat);
 
   if (result.infraFailure) {
-    const wrote = await failSubmission(submissionId, config.workerId, `Judge0 internal error: ${result.statusDescription ?? 'unknown'}`);
-    console.error(`[${config.workerId}] ${submissionId} FAILED: Judge0 internal error${wrote ? '' : ' (discarded - no longer owned)'}`);
+    // Judge0's own internal error (status.id=13) - a bad moment on Judge0's side, not our request
+    // being malformed, so it's worth retrying just like a 5xx.
+    await handleFailure(submissionId, submission.retryCount, {
+      retryable: true,
+      failureReason: 'JUDGE0_INTERNAL_ERROR',
+      errorMessage: `Judge0 internal error: ${result.statusDescription ?? 'unknown'}`,
+    });
     return;
   }
 
@@ -121,8 +163,23 @@ async function reaperLoop() {
   }
 }
 
+async function retryLoop() {
+  while (!shuttingDown) {
+    try {
+      const promoted = await promoteReadyRetries();
+      for (const id of promoted) {
+        await enqueueSubmission(redis, id);
+        console.log(`[${config.workerId}] retry ready for ${id} -> re-queued`);
+      }
+    } catch (err) {
+      console.error(`[${config.workerId}] retry scanner error:`, err.message);
+    }
+    await sleep(config.retryScanIntervalSeconds * 1000);
+  }
+}
+
 async function main() {
-  await Promise.all([consumeLoop(), reaperLoop()]);
+  await Promise.all([consumeLoop(), reaperLoop(), retryLoop()]);
   await redis.quit();
   await pool.end();
   console.log(`[${config.workerId}] stopped`);

@@ -30,4 +30,8 @@ export const config = {
   heartbeatIntervalSeconds: Number(process.env.HEARTBEAT_INTERVAL_SECONDS ?? 5),
   // How often the reaper sweeps for RUNNING jobs whose lease has expired.
   reaperIntervalSeconds: Number(process.env.REAPER_INTERVAL_SECONDS ?? 5),
+  // How often the retry scanner sweeps for RETRYING jobs whose backoff has elapsed. Short by
+  // default since backoffs themselves are short (1s/2s/4s) - a slow scan would add needless
+  // latency on top of the backoff we already decided on.
+  retryScanIntervalSeconds: Number(process.env.RETRY_SCAN_INTERVAL_SECONDS ?? 1),
 };

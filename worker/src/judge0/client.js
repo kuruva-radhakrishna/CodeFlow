@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { Judge0ServerError, Judge0NetworkError, Judge0TimeoutError, Judge0RequestError } from './errors.js';
 
 const MAX_POLL_ATTEMPTS = 5;
 
@@ -17,6 +18,23 @@ function toBase64(str) {
   return Buffer.from(str ?? '', 'utf8').toString('base64');
 }
 
+async function judge0Fetch(url, options) {
+  let res;
+  try {
+    res = await fetch(url, options);
+  } catch (cause) {
+    throw new Judge0NetworkError(cause);
+  }
+  if (!res.ok) {
+    const body = await res.text();
+    // 5xx = Judge0's own problem, worth retrying. 4xx = our request was malformed - Judge0 will
+    // reject an identical retry the exact same way, so retrying just wastes quota for nothing.
+    if (res.status >= 500) throw new Judge0ServerError(res.status, body);
+    throw new Judge0RequestError(res.status, body);
+  }
+  return res.json();
+}
+
 // base64_encoded=true for both directions: Judge0's plain-text mode (base64_encoded=false)
 // rejects some otherwise-valid submissions as "cannot be converted to UTF-8" (observed with
 // plain ASCII C++ source), and base64 is what Judge0 itself recommends to avoid that whole class
@@ -25,7 +43,7 @@ function toBase64(str) {
 // daily quota. Some public deployments cap or ignore wait=true under load, so we fall back to a
 // short bounded poll (still just a handful of requests, not a real poll loop).
 export async function submitToJudge0({ languageId, sourceCode, stdin }) {
-  const submitRes = await fetch(`${config.judge0.apiUrl}/submissions?base64_encoded=true&wait=true`, {
+  let result = await judge0Fetch(`${config.judge0.apiUrl}/submissions?base64_encoded=true&wait=true`, {
     method: 'POST',
     headers: headers(),
     body: JSON.stringify({
@@ -34,22 +52,18 @@ export async function submitToJudge0({ languageId, sourceCode, stdin }) {
       stdin: toBase64(stdin),
     }),
   });
-  if (!submitRes.ok) {
-    throw new Error(`Judge0 submit failed: ${submitRes.status} ${await submitRes.text()}`);
-  }
 
-  let result = await submitRes.json();
   let attempts = 0;
   while (result.status && result.status.id <= 2 && attempts < MAX_POLL_ATTEMPTS) {
     await sleep(1000 * (attempts + 1));
-    const pollRes = await fetch(`${config.judge0.apiUrl}/submissions/${result.token}?base64_encoded=true`, {
+    result = await judge0Fetch(`${config.judge0.apiUrl}/submissions/${result.token}?base64_encoded=true`, {
       headers: headers(),
     });
-    if (!pollRes.ok) {
-      throw new Error(`Judge0 poll failed: ${pollRes.status} ${await pollRes.text()}`);
-    }
-    result = await pollRes.json();
     attempts += 1;
+  }
+
+  if (result.status && result.status.id <= 2) {
+    throw new Judge0TimeoutError();
   }
 
   return result;

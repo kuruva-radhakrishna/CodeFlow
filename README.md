@@ -34,8 +34,10 @@ to the next — no numbers get claimed until they're actually measured under loa
       limiting/retries, so those solve a demonstrated problem instead of being added speculatively)
 - [x] Phase 6 — rate limiting (Redis fixed-window) + idempotency hardening (DB constraint as the
       race authority, not check-then-act; explicit rejection of key-reuse-with-different-payload)
-- [ ] Phase 7 — retries + backoff + dead-letter queue (distinct from Phase 5's crash recovery:
-      this is about deliberately retrying a job that legitimately failed, e.g. Judge0 5xx)
+- [x] Phase 7 — retries + exponential backoff + dead-letter handling (distinct from Phase 5's
+      crash recovery: this is about deliberately retrying a job that legitimately failed, e.g.
+      Judge0 5xx; the DLQ is a `FAILED` row in Postgres with enough context to investigate, not a
+      separate Redis queue - see below for why)
 - [ ] Phase 8 — worker concurrency + horizontal scaling
 - [ ] Phase 9 — observability + metrics (queue latency, execution latency, end-to-end)
 - [ ] Phase 10 — load testing (k6) at 5 / 10 / 20 workers, against infrastructure we control
@@ -225,6 +227,77 @@ Test C is the one worth dwelling on: it's the exact race the plan called out as 
 safe from a check-then-act `SELECT`-then-`INSERT` pattern, and it was verified against Postgres
 for real, with genuinely concurrent requests (fired with shell `&`/`wait`, not sequential awaits) -
 not just reasoned about.
+
+### Retries, backoff, and the dead-letter record
+
+Phase 5 answers "can we recover ownership of an abandoned job?" (a worker died mid-execution).
+Phase 7 answers a different question: "should we try this job again, and how many times?" (the
+worker didn't die - Judge0 itself, or the network, had a bad moment). They're deliberately separate
+mechanisms operating on **disjoint statuses** (`RUNNING` for the reaper, `RETRYING` for the retry
+scanner) so they can never contend with each other.
+
+- **Only infrastructure failures are retryable.** A real HTTP response gets classified at the
+  Judge0 adapter boundary (`worker/src/judge0/errors.js`): a 5xx or a network-level failure
+  (`fetch` itself throwing) or a poll-budget timeout is `retryable`; a 4xx (our request was
+  malformed - wrong language id, bad encoding) is not, because retrying an identical malformed
+  request will fail identically every time and just burns Judge0 quota for nothing. Judge0's own
+  internal error (`status.id=13`, a real HTTP 200 with a "something went wrong on our side" body)
+  is treated as retryable too - it's Judge0 having a bad moment, not our request being wrong.
+  Compilation errors, runtime errors, and TLE are never even candidates for retry - they're
+  `COMPLETED` with an `execution_status`, not a failure at all, so this logic never sees them.
+- **The decision is a pure function** (`worker/src/retryPolicy.js`, `decideOutcome`): given
+  `{retryable, retryCount}`, it returns `RETRY` with a backoff (`2^retryCount` seconds - 1s, 2s,
+  4s) or `FAIL` (either the failure wasn't retryable at all, or `retry_count` already hit
+  `MAX_RETRIES` (3), in which case the reason is overridden to `MAX_RETRIES_EXCEEDED`). No I/O,
+  so it's exhaustively unit-testable without touching Postgres, Redis, or Judge0.
+- **`retry_count` is deliberately separate from `attempt_count`.** `attempt_count` (Phase 5) counts
+  every real claim, including crash-recovery reclaims that have nothing to do with retry policy;
+  `retry_count` counts only deliberate retries-after-failure. A flaky worker environment causing a
+  few crash recoveries shouldn't eat into a job's actual retry budget.
+- **Retry state lives in Postgres, not Redis-only** (`next_retry_at`, `failure_reason`,
+  `retry_count` are real columns) - a worker crashing during the backoff window doesn't lose the
+  retry decision. A separate loop (`worker/src/retryScanner.js`, disjoint from the reaper) promotes
+  any `RETRYING` row whose `next_retry_at` has passed back to `QUEUED` and re-enqueues it; from
+  there it's indistinguishable from any other queued job, so the entire claim/lease/heartbeat/
+  ownership-guarded-completion machinery from Phase 5 applies to a retried attempt with zero
+  special-casing.
+- **No dedicated DLQ infrastructure yet, on purpose.** A permanently failed job is simply a
+  `FAILED` row with `failure_reason` and `error_message` preserved - enough to investigate. A
+  second Redis queue for dead letters is a real future option, but only if load testing (Phase 10)
+  actually demonstrates a need for one; building it speculatively now would be exactly the kind of
+  feature-for-its-own-sake this project is trying to avoid.
+
+### Verified (2026-09-24): retries and backoff
+
+Layered to respect the public Judge0 instance's quota, per plan: pure-logic tests need no I/O at
+all; DB-transition tests exercise the real worker functions against real Postgres with **zero**
+Judge0 calls (failures are simulated at the exact point Judge0's adapter would normally report
+them - a controlled injection at the adapter boundary, not a mock server); only the final
+integration check uses real Judge0.
+
+**Pure policy** (`retryPolicy.decideOutcome`, no I/O): `retryCount` 0/1/2 with `retryable:true` ->
+`RETRY` with backoff 1s/2s/4s exactly; `retryCount:3` -> `FAIL`/`MAX_RETRIES_EXCEEDED`;
+`retryable:false` -> `FAIL` immediately regardless of `retryCount`.
+
+**DB transitions** (real Postgres, no Judge0, 25/25 assertions passed):
+
+| Test | Result |
+|---|---|
+| Transient failure -> succeeds on retry | Claimed, scheduled a retry (`RETRYING`, `retry_count:1`, `next_retry_at` ~1s out); confirmed the scanner would **not** promote it early; slept past the backoff; scanner promoted it to `QUEUED`; a different worker re-claimed and completed it - final `COMPLETED`, `attempt_count:2` (1 failed + 1 successful attempt) |
+| Transient failure -> exhausts retries (DLQ) | 4 simulated consecutive failures (1 original + 3 retries); final state `FAILED`, `failure_reason: MAX_RETRIES_EXCEEDED`, `retry_count` capped at exactly 3, `attempt_count: 4` |
+| Non-retryable failure | Straight to `FAILED` on the first failure, `retry_count` stayed 0 - never entered the retry path at all |
+| Worker crash during backoff vs. Phase 5 recovery | A `RETRYING` row survived a reaper sweep untouched (reaper only ever looks at `RUNNING`) and wasn't promoted by the retry scanner before its `next_retry_at` - confirmed the two mechanisms structurally can't fight over the same row |
+| Idempotent retry | Every operation in every test above was an `UPDATE` by existing id - row count for the whole test run matched the number of ids explicitly created, exactly |
+| Backoff actually elapses | The retry-success test genuinely slept past a real 1s backoff before promotion succeeded - not an immediate re-hammer |
+
+**Final integration check** (2 real Judge0 calls against `ce.judge0.com`): a normal submission
+through the *actual* worker process end-to-end confirmed the new retry-aware code paths don't
+regress the happy path (`COMPLETED`/`ACCEPTED`, `retry_count:0`). A submission with a deliberately
+invalid `languageId` (999999) got a genuine Judge0 `422`, was classified as non-retryable
+(`Judge0RequestError`, not `Judge0ServerError` - the >=500 threshold correctly treats any non-5xx
+as a client-request problem), and went straight to `FAILED` with `retry_count:0` and the real
+Judge0 error text preserved in `error_message` - no retries wasted on a request that would fail
+identically every time.
 
 ### Verified (2026-09-24): the queue survives a worker outage
 

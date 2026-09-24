@@ -28,7 +28,14 @@ CREATE TABLE IF NOT EXISTS submissions (
     execution_time  NUMERIC,
     memory_used     INTEGER,
 
-    retry_count     INTEGER NOT NULL DEFAULT 0,  -- reserved for Phase 7's deliberate retry-after-failure policy
+    -- Deliberate retry-after-failure budget (Phase 7), independent of attempt_count below: a
+    -- flaky worker environment causing crash recoveries shouldn't eat into a job's retry budget.
+    -- next_retry_at/failure_reason live here (not Redis-only) so a worker crash during backoff
+    -- doesn't lose the retry decision - Redis stays "what needs processing", Postgres stays "what
+    -- is the authoritative state of this submission".
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    next_retry_at   TIMESTAMPTZ,
+    failure_reason  TEXT,
     worker_id       TEXT,
     error_message   TEXT,
 
@@ -56,3 +63,4 @@ CREATE INDEX IF NOT EXISTS submissions_user_id_idx ON submissions (user_id);
 CREATE INDEX IF NOT EXISTS submissions_status_idx ON submissions (status);
 CREATE INDEX IF NOT EXISTS submissions_created_at_idx ON submissions (created_at DESC);
 CREATE INDEX IF NOT EXISTS submissions_stale_lease_idx ON submissions (lease_until) WHERE status = 'RUNNING';
+CREATE INDEX IF NOT EXISTS submissions_pending_retry_idx ON submissions (next_retry_at) WHERE status = 'RETRYING';

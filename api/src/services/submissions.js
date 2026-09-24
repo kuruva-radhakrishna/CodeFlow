@@ -11,6 +11,7 @@ const ROW_TO_DTO_FIELDS = `
   stdout, stderr, compile_output AS "compileOutput",
   execution_time AS "executionTime", memory_used AS "memoryUsed",
   retry_count AS "retryCount", attempt_count AS "attemptCount",
+  next_retry_at AS "nextRetryAt", failure_reason AS "failureReason",
   worker_id AS "workerId", error_message AS "errorMessage",
   lease_until AS "leaseUntil", last_heartbeat_at AS "lastHeartbeatAt",
   created_at AS "createdAt", queued_at AS "queuedAt", started_at AS "startedAt", completed_at AS "completedAt"

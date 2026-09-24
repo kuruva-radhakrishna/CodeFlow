@@ -33,7 +33,9 @@ export async function renewLease(id, workerId, leaseSeconds) {
 
 export async function getSubmissionForExecution(id) {
   const result = await pool.query(
-    `SELECT id, language_id AS "languageId", source_code AS "sourceCode", stdin FROM submissions WHERE id = $1`,
+    `SELECT id, language_id AS "languageId", source_code AS "sourceCode", stdin,
+            retry_count AS "retryCount"
+     FROM submissions WHERE id = $1`,
     [id],
   );
   return result.rows[0] ?? null;
@@ -67,15 +69,35 @@ export async function completeExecution(id, workerId, result) {
   return r.rows.length > 0;
 }
 
-// The job failed - OUR infrastructure (Judge0 itself, the network, the worker) couldn't produce
-// a result. Distinct from the user's program failing, which is still status=COMPLETED.
+// The job permanently failed - either a non-retryable infra error, or a retryable one that has
+// exhausted its retry budget. Distinct from the user's program failing, which is COMPLETED.
 // Ownership-guarded for the same reason as completeExecution.
-export async function failSubmission(id, workerId, errorMessage) {
+export async function failSubmission(id, workerId, { failureReason, errorMessage }) {
   const r = await pool.query(
-    `UPDATE submissions SET status = 'FAILED', completed_at = now(), error_message = $3
+    `UPDATE submissions
+     SET status = 'FAILED', completed_at = now(), failure_reason = $3, error_message = $4
      WHERE id = $1 AND status = 'RUNNING' AND worker_id = $2
      RETURNING id`,
-    [id, workerId, errorMessage],
+    [id, workerId, failureReason, errorMessage],
   );
   return r.rows.length > 0;
+}
+
+// Retryable infra failure, budget not yet exhausted: schedule the next attempt instead of
+// failing permanently. Retry state (next_retry_at, retry_count) lives in Postgres - not Redis -
+// so a worker crash during the backoff window doesn't lose the decision to retry. The retry
+// scanner (worker/src/retryScanner.js) is what actually promotes this back to QUEUED once
+// next_retry_at has passed. Ownership-guarded for the same reason as completeExecution.
+export async function scheduleRetry(id, workerId, { failureReason, errorMessage, backoffSeconds }) {
+  const r = await pool.query(
+    `UPDATE submissions
+     SET status = 'RETRYING',
+         next_retry_at = now() + ($3 || ' seconds')::interval,
+         retry_count = retry_count + 1,
+         failure_reason = $4, error_message = $5
+     WHERE id = $1 AND status = 'RUNNING' AND worker_id = $2
+     RETURNING id, retry_count AS "retryCount", next_retry_at AS "nextRetryAt"`,
+    [id, workerId, String(backoffSeconds), failureReason, errorMessage],
+  );
+  return r.rows[0] ?? null;
 }

@@ -17,14 +17,24 @@ This README is the engineering log, with evidence for every claim. For the resum
 - Worker: `codeflow-worker` on Render, running the mock execution provider (Phase 10) - no Judge0
   credentials involved in this deployment at all.
 
-Both run on Render's **free tier**, which means both **spin down after ~15 minutes of
-inactivity** and take up to 50s to wake on the next request - that's a Render free-tier
-characteristic, not a CodeFlow one (see [Phase 10's benchmark](#verified-2026-09-24-5-vs-10-vs-20-worker-lanes)
-for real throughput numbers, measured with the free-tier cold-start removed from the equation).
-Submit a job and poll its result - if the worker was asleep, the first one will sit `QUEUED`
-noticeably longer than usual while it wakes, then subsequent ones will be fast:
+Both run on Render's **free tier**, which spins a service down after ~15 minutes with no incoming
+HTTP request to it. That's straightforward for the **API** - any request wakes it, ~50s cold
+start, then it's normal. It's a real limitation for the **worker**, worth being precise about
+rather than glossing over: the worker's free-tier "up/down" state is driven entirely by HTTP
+requests to *its own* URL (the health-check listener from `v1.0.1`, added only so Render has a
+port to consider "up" at all) - a new job landing in Upstash is a Redis event, not an HTTP
+request, and **does not wake the worker**. If the worker is asleep when a submission is created,
+that submission will sit `QUEUED` indefinitely, not just "a bit longer" - nothing about Redis
+activity gives Render a reason to spin it back up.
+
+So: **this is a live demo environment, correct and fully verified while the worker is awake, not
+an always-on production deployment.** To see a submission actually processed, hit the worker's own
+URL first (which wakes it, same as any free-tier web service) *before or shortly after* submitting
+a job - not instead of it:
 
 ```bash
+curl https://codeflow-worker.onrender.com/          # wakes the worker if it was asleep
+
 curl -X POST https://codeflow-api-1r33.onrender.com/api/v1/submissions \
   -H "Content-Type: application/json" \
   -d '{"userId":"you","languageId":71,"sourceCode":"print(\"hello\")","stdin":""}'
@@ -33,10 +43,20 @@ curl -X POST https://codeflow-api-1r33.onrender.com/api/v1/submissions \
 curl https://codeflow-api-1r33.onrender.com/api/v1/submissions/<id>/result
 ```
 
+This is a genuine, known limitation of running a queue consumer behind a free-tier HTTP-triggered
+platform - not a CodeFlow correctness issue, and not one worth engineering around by, say, adding a
+self-ping keep-alive: that would just be working around Render's free tier rather than saying
+anything about the distributed system itself. The evidence that actually matters -
+[claim isolation](#verified-2026-09-24-concurrency-and-horizontal-scaling),
+[worker recovery](#verified-2026-09-24-worker-recovery-and-the-ownership-race), and the
+[5/10/20-lane throughput benchmark](#verified-2026-09-24-5-vs-10-vs-20-worker-lanes) - was all
+measured locally against the same real Neon/Upstash instances, entirely independent of Render's
+free-tier lifecycle behavior, and stands regardless of whether the live worker happens to be awake
+right now.
+
 Deployed from `v1.0.1` (a small patch on top of the frozen `v1.0.0` - `API_PORT` rename, removed
-an unused Judge0 requirement from the API's config, and an optional health-check listener so the
-worker can run on Render's free Web Service tier instead of the $7/month-minimum paid Background
-Worker type; see that tag's commit for the full reasoning). Both services were verified live,
+an unused Judge0 requirement from the API's config, and the worker's health-check listener
+described above; see that tag's commit for the full reasoning). Both services were verified live,
 end-to-end, against the real Neon/Upstash instances before writing this section down.
 
 ## Results at a glance
@@ -273,6 +293,12 @@ the answer to "what happens if X?"
   induced and observed.
 - **The real Judge0 execution-provider benchmark** (RapidAPI key or self-hosted, under real load)
   was deliberately not attempted - see [Load testing](#load-testing-isolating-queuesystem-throughput-from-judge0).
+- **The live worker isn't guaranteed always-on** - it runs on Render's free Web Service tier
+  specifically so it could be deployed at zero cost (see [Live demo](#live-demo)), and that tier's
+  wake mechanism is HTTP-request-driven, not Redis-activity-driven: a new job doesn't wake a sleeping
+  worker. This is a deployment-platform limitation of the free-tier demo, not a gap in CodeFlow
+  itself - deliberately not "fixed" by adding a self-ping keep-alive, since that would just be
+  working around Render's free tier rather than demonstrating anything about the distributed system.
 
 ### Job status vs. execution status
 

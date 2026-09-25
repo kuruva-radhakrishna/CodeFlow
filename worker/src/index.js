@@ -14,6 +14,7 @@ import { recoverStaleJobs } from './reaper.js';
 import { promoteReadyRetries } from './retryScanner.js';
 import { decideOutcome, MAX_RETRIES } from './retryPolicy.js';
 import { createMetrics, publishSnapshot } from './metrics.js';
+import { startHealthServer } from './healthServer.js';
 
 // Shared connection for non-blocking commands (enqueue from the reaper/retry loops). Each
 // concurrency lane gets its OWN connection for dequeuing - BRPOP blocks the connection it's
@@ -217,6 +218,12 @@ async function metricsLoop() {
 
 async function main() {
   console.log(`[${config.workerId}] starting ${config.workerConcurrency} lane(s)`);
+
+  if (config.port) {
+    startHealthServer(config.port);
+    console.log(`[${config.workerId}] health server listening on :${config.port} (for platforms that require a bound port)`);
+  }
+
   const lanes = Array.from({ length: config.workerConcurrency }, (_, i) => runLane(i));
 
   await Promise.all([...lanes, reaperLoop(), retryLoop(), metricsLoop()]);

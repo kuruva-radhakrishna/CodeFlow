@@ -16,13 +16,16 @@ function required(name, fallback) {
 }
 
 export const config = {
-  port: Number(process.env.PORT ?? 3000),
+  // Render (and most PaaS) inject PORT themselves and expect the app to honor it, so that always
+  // wins when present. Locally, the port lives in API_PORT (not PORT) - api/ and worker/ share
+  // one root .env, and the worker also reacts to a bare PORT (for its own optional health server
+  // on platforms that need one) - naming the API's port distinctly means the two processes can
+  // never end up fighting over the same port when run side by side locally.
+  port: Number(process.env.PORT ?? process.env.API_PORT ?? 3000),
   nodeEnv: process.env.NODE_ENV ?? 'development',
   databaseUrl: required('DATABASE_URL'),
   redisUrl: required('REDIS_URL'),
-  judge0: {
-    apiUrl: required('JUDGE0_API_URL'),
-    apiKey: process.env.JUDGE0_API_KEY ?? '',
-  },
+  // The API never talks to Judge0 (only the worker does) - it has no business requiring a
+  // Judge0 env var just to boot.
   rateLimitPerMinute: Number(process.env.RATE_LIMIT_PER_MINUTE ?? 5),
 };

@@ -57,4 +57,12 @@ export const config = {
   workerConcurrency: Number(process.env.WORKER_CONCURRENCY ?? 3),
   // How often this worker logs a cumulative throughput/outcome summary.
   metricsLogIntervalSeconds: Number(process.env.METRICS_LOG_INTERVAL_SECONDS ?? 15),
+  // Only set by platforms that require a bound HTTP port (e.g. Render's free-tier Web Service
+  // type, which injects PORT itself - each Render service gets its own isolated environment, so
+  // this never collides with the API's own PORT there). Locally, api/ and worker/ share one root
+  // .env, and the API's own port is API_PORT (not PORT) specifically so a plain PORT in that
+  // shared file can never leak into the worker and make both processes fight over the same port.
+  // null here means "not deployed behind a platform that needs a bound port" - a normal
+  // background-worker deploy or local dev. See healthServer.js.
+  port: process.env.PORT ? Number(process.env.PORT) : null,
 };

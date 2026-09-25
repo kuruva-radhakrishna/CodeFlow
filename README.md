@@ -13,6 +13,14 @@ This README is the engineering log, with evidence for every claim. For the resum
 
 ## Live demo
 
+**Frontend: https://codeflow-nine-henna.vercel.app** - a thin demo layer (single static HTML file,
+no build step, no framework) over the live API. Submit code, watch it flow through
+`QUEUED -> RUNNING -> COMPLETED`, and see the actual distributed-system internals: submission id,
+worker id, queue-wait/processing/end-to-end timing, and a live system panel - deliberately not
+hidden behind a generic "run code" UI. It also does the worker-wake step below for you
+automatically. Not "Phase 13" of the distributed-systems engineering - the backend is what's
+interesting here, this just makes it clickable.
+
 - API: **https://codeflow-api-1r33.onrender.com** (e.g. [`/api/v1/health`](https://codeflow-api-1r33.onrender.com/api/v1/health), [`/api/v1/metrics`](https://codeflow-api-1r33.onrender.com/api/v1/metrics))
 - Worker: `codeflow-worker` on Render, running the mock execution provider (Phase 10) - no Judge0
   credentials involved in this deployment at all.
@@ -54,10 +62,18 @@ measured locally against the same real Neon/Upstash instances, entirely independ
 free-tier lifecycle behavior, and stands regardless of whether the live worker happens to be awake
 right now.
 
-Deployed from `v1.0.1` (a small patch on top of the frozen `v1.0.0` - `API_PORT` rename, removed
-an unused Judge0 requirement from the API's config, and the worker's health-check listener
-described above; see that tag's commit for the full reasoning). Both services were verified live,
-end-to-end, against the real Neon/Upstash instances before writing this section down.
+Backend deployed from `v1.0.3` - small, deliberate patches on top of the frozen `v1.0.0`
+(`API_PORT` rename, removed an unused Judge0 requirement from the API's config, the worker's
+health-check listener, and CORS; see each tag's commit for the full reasoning). One of those is
+worth telling honestly rather than skipping: the first CORS attempt (`v1.0.2`, hand-rolled
+middleware) worked in every local test but consistently did **not** send the header once actually
+deployed to Render - confirmed independently via curl and two separate real browsers, all agreeing
+the live response lacked the header despite the correct code being live. Root cause not fully
+identified; fixed (`v1.0.3`) by swapping to the standard `cors` package instead of continuing to
+chase it - the safer, better-tested choice regardless of the exact cause, and it fixed it
+immediately. Frontend and both backend services were verified live, end-to-end, against the real
+Neon/Upstash instances - including an actual click-through of the frontend's Run Code flow -
+before writing this section down.
 
 ## Results at a glance
 

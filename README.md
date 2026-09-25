@@ -8,13 +8,87 @@ worker-failure recovery, observability, and load-tested benchmarks.
 **Judge0 handles code execution. This project is the distributed system that manages everything
 around execution** — the API, the queue, the workers, the state machine, and the failure handling.
 
-## Architecture (target)
+## Results at a glance
+
+What follows is a phase-by-phase engineering log with full evidence for each claim - this section
+is the summary for someone who wants the headline first. Every number below is **measured**, not
+estimated; each links to the section with the actual command output.
+
+- **Queue/system load test**: 100 submissions, constant 10 req/s arrival, mock execution provider,
+  concurrency swept 5 → 10 → 20 worker lanes. Peak throughput **9.35 jobs/s**, queue-wait p50
+  dropped from **7.3s to 1.3s** as concurrency increased, worker-processing time stayed flat
+  (~630-940ms) across all three runs - proving the bottleneck was queue capacity, not execution
+  time. **0% failure rate** in all three runs. ([full results](#verified-2026-09-24-5-vs-10-vs-20-worker-lanes))
+- **Claim isolation under real concurrency**: 8 genuinely simultaneous claimants per row, across 5
+  rows - exactly 1 DB winner every time, zero exceptions. ([evidence](#verified-2026-09-24-concurrency-and-horizontal-scaling))
+- **Worker crash recovery**: a real, killed-mid-execution worker process's job was recovered by a
+  fresh worker and completed correctly, with zero stuck rows and zero duplicate completions.
+  ([evidence](#verified-2026-09-24-worker-recovery-and-the-ownership-race))
+- **Retries under real concurrent load**: the load test's simulated failures triggered real
+  retry-then-succeed cycles (1-8 per run) with 0% reaching the dead-letter state - previously only
+  verified in isolated single-job tests, now proven under actual throughput.
+  ([evidence](#verified-2026-09-24-5-vs-10-vs-20-worker-lanes))
+- **Idempotency under real concurrency**: 5 genuinely simultaneous requests with the same
+  idempotency key and payload → exactly 1 submission created, all 5 callers got the same id.
+  ([evidence](#verified-2026-09-24-rate-limiting-and-idempotency-under-real-concurrency))
+
+**What's architectural reasoning, not a live measurement**: the claim that duplicate Judge0
+execution is *possible but safe* (proven via a deliberately forced ownership race, not organic
+production traffic); that horizontal scaling across multiple machines behaves like scaling lanes
+within one process (the underlying guarantees are identical by construction, but multi-machine
+network partitions specifically were never tested); and the [failure-mode table](#failure-modes)
+below, most of whose rows are individually evidenced elsewhere in this README but are presented
+together here as a reference, not as one single end-to-end test.
+
+## Architecture
+
+The target topology - every box below has shipped and been exercised, except the execution
+provider swap to a real, non-public Judge0 (RapidAPI/self-hosted), which is a configuration change
+away but hasn't itself been benchmarked (see [Load testing](#load-testing-isolating-queuesystem-throughput-from-judge0)):
 
 ```
-Client -> REST API (Node/Express) -> PostgreSQL (submission state)
-                                   -> Redis (job queue, rate limits, leases)
-                                          -> Worker pool -> Judge0 -> result -> PostgreSQL
+                              ┌──────────────┐
+                              │    Client    │
+                              └──────┬───────┘
+                                     │
+                              ┌──────▼───────┐
+                              │  API Server   │  Node/Express
+                              │ (rate limit,  │
+                              │  idempotency) │
+                              └───┬───────┬───┘
+                                  │       │
+                         ┌────────▼──┐ ┌──▼────────┐
+                         │ PostgreSQL │ │   Redis   │
+                         │  (source   │ │  (queue,  │
+                         │  of truth) │ │  leases,  │
+                         │            │ │rate limit)│
+                         └─────▲──────┘ └─────┬─────┘
+                               │              │
+                    ┌──────────┴──────┬───────┴──────────┐
+                    │                 │                  │
+              ┌─────▼─────┐     ┌─────▼─────┐      ┌─────▼─────┐
+              │  Worker 1  │     │  Worker 2  │ ...  │  Worker N  │
+              │  N lanes   │     │  N lanes   │      │  N lanes   │
+              │ (claim/    │     │            │      │            │
+              │  lease/    │     │            │      │            │
+              │  heartbeat/│     │            │      │            │
+              │  retry)    │     │            │      │            │
+              └─────┬──────┘     └─────┬──────┘      └─────┬──────┘
+                    │                  │                   │
+                    └──────────────────┼───────────────────┘
+                                       ▼
+                              ┌──────────────────┐
+                              │ Execution Provider │
+                              │  Judge0 (real) or   │
+                              │  mock (JUDGE0_      │
+                              │  PROVIDER=mock)     │
+                              └──────────────────┘
 ```
+
+Every worker is identical and stateless beyond its in-memory metrics counters - Postgres is the
+only durable state, Redis is only work-distribution + coordination. Any worker (any lane, any
+process, any machine) can claim any job; the atomic claim + ownership-guarded completion is what
+makes that safe (Phases 5-8).
 
 ## Status
 
@@ -46,39 +120,69 @@ to the next — no numbers get claimed until they're actually measured under loa
       per-worker throughput). Not a Prometheus exporter - a plain JSON snapshot, deliberately
 - [x] Phase 10 — load testing at 5 / 10 / 20 worker lanes, against a mock execution provider (not
       k6 - see below for why; the real Judge0 instance's quota deliberately isn't part of this)
-- [ ] Phase 11 — deployment + documentation
-- [ ] Phase 12 — benchmark writeup
+- [x] Phase 11 — deployment topology, a consolidated [failure-mode table](#failure-modes), a
+      zero-Judge0-credential quickstart, and this results-first restructure of the README
+- [ ] Phase 12 — final resume/interview writeup
 
 ## Local development
 
-Prerequisites: Node.js 20+.
+Prerequisites: Node.js 20+, and a Postgres + Redis you can point at (see below - either is a
+2-minute free signup, no credit card, no Docker required).
 
-Postgres and Redis run as free cloud-hosted instances ([Neon](https://neon.tech) and
-[Upstash](https://upstash.com)) rather than via Docker — this dev machine has no admin rights, so
-Docker Desktop isn't an option. `docker-compose.yml` is kept in the repo for later (a machine that
-does have Docker, or the eventual deployment story) but isn't required for local dev today.
+### Quickstart (no Judge0 credentials needed)
 
 ```bash
-cp .env.example .env
-# fill in DATABASE_URL (Neon) and REDIS_URL (Upstash) in .env
+git clone <this repo> && cd codeflow
 npm install
+cp .env.example .env
+# fill in DATABASE_URL and REDIS_URL in .env (see "Postgres and Redis" below)
 psql "$DATABASE_URL" -f database/schema.sql   # or run schema.sql via any Postgres client
-npm run dev:api                                # starts the API on :3000
-npm run dev:worker                             # starts a worker (run this in a second terminal)
+
+npm run dev:api                                # terminal 1: API on :3000
+
+JUDGE0_PROVIDER=mock npm run dev:worker        # terminal 2: worker, mock execution provider
 ```
+
+That's a fully working system end to end - submit code, watch it flow through the queue, get a
+result back - with **zero external calls to Judge0 and zero Judge0 credentials**. The mock
+provider (`worker/src/judge0/mockClient.js`) sits behind the exact same adapter contract as the
+real one (Phase 10), so this is genuinely exercising the real queue/worker/retry/lease machinery,
+just with simulated execution. This is also what the [load tests](#load-testing-isolating-queuesystem-throughput-from-judge0)
+run against.
+
+```bash
+curl -X POST http://localhost:3000/api/v1/submissions \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"me","languageId":71,"sourceCode":"print(\"hello\")","stdin":""}'
+# -> {"submissionId":"sub_...","status":"QUEUED","replayed":false}
+
+curl http://localhost:3000/api/v1/submissions/<id>/result
+# -> {"status":"COMPLETED","executionStatus":"ACCEPTED","stdout":"mock output for: print(\"hello\")\n",...}
+```
+
+### Postgres and Redis
+
+Free cloud-hosted instances ([Neon](https://neon.tech) for Postgres, [Upstash](https://upstash.com)
+for Redis) rather than Docker - this project's own dev machine has no admin rights, so Docker
+Desktop wasn't an option, and it turned out to need nothing more: both are a signup + connection
+string, no local install. `docker-compose.yml` is in the repo for a machine that does have Docker
+(or a self-hosted deployment) and defines the same schema/version - either path works identically
+from the app's point of view, since it only ever sees a `DATABASE_URL`/`REDIS_URL`.
 
 The API and worker are independent processes that only communicate through Redis (the queue) and
 Postgres (submission state) - never directly. You can start any number of `npm run dev:worker`
 instances; each is a separate consumer of the same queue. Stopping every worker doesn't lose
 submissions - they simply accumulate in Redis until a worker is running again to drain them.
 
-Judge0: development currently points at the public CE instance (`ce.judge0.com`), which needs no
-signup but is rate-limited (~50 requests/day) - fine for validating correctness (a handful of
-submissions), not for load testing. Swap `JUDGE0_API_URL`/`JUDGE0_API_KEY` in `.env` for a
-RapidAPI key or a self-hosted instance later; the worker's Judge0 client (`worker/src/judge0/`) is
-written against the same HTTP contract either way, so the swap needs no code changes. Load testing
-(Phase 10) must run against infrastructure we control, or we'd be measuring Judge0's public
-service's rate limit instead of CodeFlow's own behavior.
+### Optional: real Judge0 execution
+
+Leave `JUDGE0_PROVIDER` unset (or set it to `real`) and the worker talks to an actual Judge0
+instance instead of the mock. Development so far has pointed at the public CE instance
+(`ce.judge0.com` - needs no signup, but is rate-limited to ~50 requests/day, fine for a handful of
+correctness checks, not for load testing). Swap `JUDGE0_API_URL`/`JUDGE0_API_KEY` in `.env` for a
+RapidAPI key or a self-hosted instance later; the worker's Judge0 client
+(`worker/src/judge0/client.js`) is written against the same HTTP contract either way, so the swap
+needs no code changes.
 
 ### API
 
@@ -88,10 +192,56 @@ GET  /api/v1/submissions/:id           submission state
 GET  /api/v1/submissions/:id/result    execution result only
 GET  /api/v1/users/:userId/submissions recent submissions for a user
 GET  /api/v1/health                    liveness + DB connectivity
+GET  /api/v1/metrics                   submission counts, latency percentiles, active workers
 ```
 
 A submission now flows `QUEUED -> RUNNING -> COMPLETED` (or `FAILED`) end-to-end through the real
 queue, a real worker process, and real Judge0 execution.
+
+## Failure modes
+
+The single most useful reference in this README for understanding what CodeFlow actually
+guarantees. Most rows are individually evidenced in the phase-by-phase log below (linked); this
+table exists to put them all in one place rather than making someone read the whole log to find
+the answer to "what happens if X?"
+
+| Scenario | What happens | Why | Evidence |
+|---|---|---|---|
+| API process dies before the Redis enqueue | The Postgres `INSERT` either committed or it didn't - if it did, the row is `QUEUED` forever with no matching Redis job (a genuine gap: nothing currently re-derives "QUEUED rows with no queue entry" - see [Known gaps](#known-gaps-not-fixed-honestly-scoped-out)). If the insert itself didn't commit, the client gets a connection error and can safely retry with the same Idempotency-Key. | Postgres commit is the only durability boundary that matters here; enqueue is a separate, non-atomic step. | — |
+| API process dies after DB insert + Redis enqueue, before responding | Client gets a connection error but the job is fully durable and queued - a retry with the same Idempotency-Key returns the existing submission rather than creating a duplicate. | Idempotency is enforced by a DB unique constraint, not by the response actually reaching the client. | [Idempotency hardening](#rate-limiting-and-idempotency-hardening) |
+| Redis unavailable | New submissions fail at the enqueue step (the API's own DB insert already succeeded, so the row exists but nothing will claim it until Redis is back and something re-queues it - same gap as above). Already-queued jobs simply wait; no data is lost, nothing currently auto-recovers past a Redis outage windowed exactly at insert time. | Redis is coordination/distribution state, never the source of truth - but the current code doesn't yet reconcile Postgres against Redis in the Redis-was-briefly-down case. | — |
+| Postgres unavailable | `/health` reports `degraded`; the worker's DB-dependent operations (claim, heartbeat, complete) fail loudly and get logged - no silent data loss, but no automatic recovery either since Postgres genuinely is the source of truth. | By design - there's nothing to substitute for the source of truth. | Phase 1-2 scaffolding |
+| Worker crashes mid-execution | The job's lease stops being renewed and expires; the reaper (any live worker, including a fresh one) recovers it back to `QUEUED` and it gets re-processed. Verified with a real OS-level process kill mid-Judge0-call. | Job leases + heartbeats + a reaper (Phase 5) | [Worker recovery](#verified-2026-09-24-worker-recovery-and-the-ownership-race) |
+| Lease expires while the worker is still (slowly) alive | A second worker may legitimately claim and complete the same job - Judge0 executes it twice. The **DB write is what's guarded**, not the execution: only the current owner's completion is ever persisted; the stale worker's late write is silently discarded. | Ownership-guarded completion (`WHERE status='RUNNING' AND worker_id=$owner`) | [The ownership race](#verified-2026-09-24-worker-recovery-and-the-ownership-race) |
+| Stale worker's result arrives after ownership already changed | Discarded - logged, zero rows affected, does not overwrite the current owner's result. | Same ownership guard as above, applied uniformly to every terminal write (complete, fail, retry-schedule). | Same as above |
+| Judge0 returns a 4xx (malformed request - bad language id, etc.) | Goes straight to `FAILED`, **not retried** - an identical retry would fail identically and just waste quota. Verified with a real Judge0 422 on an invalid `languageId`. | `Judge0RequestError` classified as non-retryable at the adapter boundary. | [Retries and backoff](#verified-2026-09-24-retries-and-backoff) |
+| Judge0 returns a 5xx, times out, or the network fails | Retried with exponential backoff (1s/2s/4s), up to 3 times; only goes to `FAILED`/dead-letter after the budget is exhausted. | `Judge0ServerError`/`Judge0NetworkError`/`Judge0TimeoutError` classified as retryable; retry state lives in Postgres so a crash during backoff doesn't lose the decision. | [Retries and backoff](#retries-backoff-and-the-dead-letter-record) |
+| Retry budget exhausted (3 retries, all failed) | `status=FAILED`, `failure_reason=MAX_RETRIES_EXCEEDED`, `error_message` preserved - a `FAILED` row IS the dead-letter record, not a separate queue. | Deliberately no separate DLQ infrastructure yet - see [Retries](#retries-backoff-and-the-dead-letter-record) for why. | [DB-transition tests](#verified-2026-09-24-retries-and-backoff) |
+| The user's program itself fails (compile error, runtime error, TLE) | `status=COMPLETED` - **not** a CodeFlow failure. `execution_status` carries the verdict (`COMPILATION_ERROR`/`RUNTIME_ERROR`/`TIME_LIMIT_EXCEEDED`). Never retried - it would fail identically every time. | The status/execution_status split (Phase 4) is the whole point of this row. | [Job status vs. execution status](#job-status-vs-execution-status) |
+| Two (or more) workers race to claim the same job | Exactly one wins; the rest see `status != 'QUEUED'` and skip it. Verified with 8 genuinely concurrent claimants per row, across 5 rows, with zero double-claims. | Atomic `UPDATE ... WHERE status='QUEUED'` | [Claim isolation](#verified-2026-09-24-concurrency-and-horizontal-scaling) |
+| The same job is delivered twice from Redis (duplicate delivery) | Whichever claim arrives first wins the atomic claim; the second sees `status != 'QUEUED'` and no-ops. No special "dedup" logic needed - it's the same guarantee as the row above. | Same atomic claim - at-least-once delivery is fine because claiming is idempotent. | [Claim isolation](#verified-2026-09-24-concurrency-and-horizontal-scaling) |
+| Two concurrent requests submit the same Idempotency-Key + same payload | Both return the same `submissionId`; exactly one Postgres row is created despite the race. | DB unique constraint as the race authority, not check-then-act. | [Idempotency under real concurrency](#verified-2026-09-24-rate-limiting-and-idempotency-under-real-concurrency) |
+| Same Idempotency-Key reused with a **different** payload | Rejected with `409 IDEMPOTENCY_KEY_REUSED`; the original submission is left untouched. | Explicit payload comparison against the existing row, not silent replay. | [Idempotency under real concurrency](#verified-2026-09-24-rate-limiting-and-idempotency-under-real-concurrency) |
+| Client exceeds the per-user rate limit | `429`, zero Postgres/Redis side effects - not even a queued row. | Rate limit checked first, before idempotency, before any write. | [Rate limiting](#verified-2026-09-24-rate-limiting-and-idempotency-under-real-concurrency) |
+| A worker crashes while the reaper/retry-scanner never touch it (deep in `time.sleep`) | Eventually recovered by **any** live worker's reaper sweep, including a fresh one started well after the crash - recovery isn't tied to the crashed worker coming back. | Reaper runs in every worker process, operates on any `RUNNING` row with an expired lease, regardless of who owns it. | [Worker recovery](#verified-2026-09-24-worker-recovery-and-the-ownership-race) |
+
+### Known gaps (not fixed, honestly scoped out)
+
+- **A narrow window between the Postgres insert and the Redis enqueue** (API crash, or a Redis
+  outage exactly at that moment) can leave a row `QUEUED` in Postgres with no matching Redis job.
+  Nothing currently reconciles this - a production version would want a periodic sweep (similar in
+  spirit to the reaper) that re-enqueues any `QUEUED` row older than a few seconds with no
+  corresponding Redis entry. Not built because it never came up in any of this project's own
+  testing (the window is genuinely narrow), and adding it without a way to *demonstrate* the gap
+  first would be exactly the kind of speculative feature this project has tried to avoid throughout.
+- **Multi-machine network partitions were never tested.** Every "multiple workers" test in this
+  project ran multiple *processes on one machine*. The correctness guarantees (atomic claim,
+  ownership-guarded writes) don't depend on the workers being on the same machine - Postgres and
+  Redis are the only shared state, and both are already accessed over the network (Neon/Upstash) -
+  but a genuine network partition between a worker and Postgres specifically, mid-lease, was never
+  induced and observed.
+- **The real Judge0 execution-provider benchmark** (RapidAPI key or self-hosted, under real load)
+  was deliberately not attempted - see [Load testing](#load-testing-isolating-queuesystem-throughput-from-judge0).
 
 ### Job status vs. execution status
 

@@ -12,12 +12,26 @@ function required(name) {
   return value;
 }
 
+const judge0Provider = process.env.JUDGE0_PROVIDER ?? 'real'; // 'real' | 'mock'
+
 export const config = {
   databaseUrl: required('DATABASE_URL'),
   redisUrl: required('REDIS_URL'),
   judge0: {
-    apiUrl: required('JUDGE0_API_URL'),
+    // Only required for the real provider - the mock never makes an HTTP call, so it shouldn't
+    // force you to have a Judge0 URL configured just to run a queue/system load test.
+    apiUrl: judge0Provider === 'real' ? required('JUDGE0_API_URL') : (process.env.JUDGE0_API_URL ?? ''),
     apiKey: process.env.JUDGE0_API_KEY ?? '',
+    provider: judge0Provider,
+    // Mock-only tuning, so a load test can shape the simulated execution-provider characteristics
+    // (Phase 10: isolate queue/system throughput from Judge0 itself, which has its own quota-
+    // limited benchmark done separately).
+    mock: {
+      minLatencyMs: Number(process.env.MOCK_LATENCY_MIN_MS ?? 50),
+      maxLatencyMs: Number(process.env.MOCK_LATENCY_MAX_MS ?? 300),
+      serverErrorRate: Number(process.env.MOCK_SERVER_ERROR_RATE ?? 0.02),
+      timeoutRate: Number(process.env.MOCK_TIMEOUT_RATE ?? 0.01),
+    },
   },
   workerId: `worker-${os.hostname()}-${process.pid}`,
   // How long each blocking dequeue waits before giving the shutdown flag a chance to run.

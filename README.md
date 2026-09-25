@@ -44,8 +44,8 @@ to the next — no numbers get claimed until they're actually measured under loa
 - [x] Phase 9 — observability + metrics (`GET /api/v1/metrics`: submission counts, queue-wait vs.
       execution-time vs. end-to-end latency percentiles, execution outcome breakdown, live
       per-worker throughput). Not a Prometheus exporter - a plain JSON snapshot, deliberately
-- [ ] Phase 10 — load testing (k6) at 5 / 10 / 20 workers, against infrastructure we control
-      (not the public Judge0 instance - see note below)
+- [x] Phase 10 — load testing at 5 / 10 / 20 worker lanes, against a mock execution provider (not
+      k6 - see below for why; the real Judge0 instance's quota deliberately isn't part of this)
 - [ ] Phase 11 — deployment + documentation
 - [ ] Phase 12 — benchmark writeup
 
@@ -420,6 +420,67 @@ spanning Phases 3-8), which turned out to be a genuinely useful stress test of i
 - 20 `COMPLETED` rows show `execution_status: null` ("unknown" in the breakdown) - these are Phase
   3's stub-completion rows, written before Judge0 was wired up in Phase 4. Real historical data,
   correctly surfaced, not a bug in this phase's aggregation query.
+
+### Load testing: isolating queue/system throughput from Judge0
+
+The public Judge0 instance's quota (~50 requests/day, and already at ~30 used by this point) simply
+cannot survive a real load test - so this phase deliberately does **not** point load at Judge0 at
+all. Instead:
+
+- **A mock execution provider** (`worker/src/judge0/mockClient.js`), selected via
+  `JUDGE0_PROVIDER=mock`, sitting behind the *exact same* adapter contract as the real client -
+  same typed errors (`Judge0ServerError`/`Judge0TimeoutError`), same raw response shape
+  (`base64_encoded=true`), same simulated latency and a small simulated failure rate. Nothing
+  downstream (`normalizeJudge0Result`, retry classification, `processSubmission`) can tell the
+  difference - this is a substitution at the adapter boundary the whole architecture has been
+  building toward since Phase 4, not a parallel test-only code path.
+- **No k6.** k6 wasn't reliably installable in this environment (no admin rights, and another
+  external-binary install saga wasn't worth it after the friction earlier in this project - see
+  the environment notes throughout this README). `load-tests/run-load-test.mjs` is a small
+  Node-native load generator instead: fires `POST /submissions` at a constant arrival rate
+  (fire-and-forget per tick, the same executor model k6's `constant-arrival-rate` uses), spread
+  across many simulated `userId`s so Phase 6's per-user rate limiting doesn't confound a
+  queue/system throughput test with admission-control behavior. It measures exactly what k6 would
+  have: request rate and submit-latency against the real API.
+- **This isolates two genuinely different bottlenecks that a naive "load test the whole thing
+  through Judge0" approach would conflate**: queue/worker throughput (what CodeFlow's own
+  infrastructure can sustain) vs. execution-provider throughput (what Judge0 itself can sustain,
+  quota-limited and entirely outside this project's control). A future, deliberately small
+  benchmark against a real Judge0 provider (RapidAPI key or self-hosted) would measure the second
+  one specifically - not attempted here.
+- `load-tests/analyze-run.mjs` computes drain time, throughput, and latency percentiles **scoped to
+  one run's own `userId` prefix** directly from Postgres, rather than reading the global
+  `/api/v1/metrics` window - so three different concurrency runs never contaminate each other's
+  numbers the way they would trying to diff two overlapping 24h windows.
+
+### Verified (2026-09-24): 5 vs. 10 vs. 20 worker lanes
+
+Same experiment, same 100 submissions at a constant 10 req/s arrival rate (`RATE=10
+DURATION_SECONDS=10`) across 200 simulated users, only `WORKER_CONCURRENCY` changed between runs.
+Real measurements, not invented:
+
+| Lanes | Throughput | Drain time | Queue wait p50 / p95 | End-to-end p50 / p95 | Failure rate |
+|---|---|---|---|---|---|
+| 5  | 5.04/s | 19.83s | 7329ms / 10391ms | 7996ms / 10979ms | 0% |
+| 10 | 7.56/s | 13.22s | 2523ms / 4826ms  | 3151ms / 5394ms  | 0% |
+| 20 | 9.35/s | 10.70s | 1341ms / 2327ms  | 2342ms / 3360ms  | 0% |
+
+A clean, expected saturation curve: at 5 lanes, throughput (5.04/s) can't keep up with the 10/s
+arrival rate, so a backlog builds and queue wait dominates end-to-end latency (7.3s of a 8.0s
+median wait is just sitting in the queue). At 20 lanes, throughput (9.35/s) nearly matches the
+input rate, the backlog barely forms, and queue wait drops to a fraction of what it was - this is
+precisely the "is it the queue or is it the execution provider" question Phase 9's latency split
+exists to answer, now shown *changing* as a direct function of worker concurrency. `processingMs`
+(worker-processing time, mock-simulated) stayed roughly flat across all three runs (~630-940ms),
+confirming the bottleneck really was queue capacity, not execution time - concurrency fixed exactly
+the thing it should have.
+
+**A bonus finding, not specifically arranged**: the mock provider's small simulated failure rate
+(2% server error + 1% timeout per attempt) triggered real retries under real concurrent load - 1
+retry in the 5-lane run, 8 in the 10-lane run, 1 in the 20-lane run - and every single one
+eventually succeeded within the 3-retry budget (0% reached `FAILED`/DLQ in any run). Phase 7's
+retry logic, previously verified only in isolated single-job tests, held up correctly under
+concurrent load without any special handling.
 
 ### Verified (2026-09-24): the queue survives a worker outage
 

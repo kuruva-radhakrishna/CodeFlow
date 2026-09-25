@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@codeflow/queue": "*",
+    "cors": "^2.8.6",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
     "nanoid": "^5.0.9",

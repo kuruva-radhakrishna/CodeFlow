@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import { submissionsRouter } from './routes/submissions.js';
 import { getMetrics } from './controllers/metricsController.js';
 import { errorHandler } from './middleware/errorHandler.js';
@@ -6,17 +7,12 @@ import { pool } from './db/pool.js';
 
 export const app = express();
 
-// Hand-rolled instead of the `cors` package - this is the entire surface a demo frontend needs
-// (any origin, since it's a public read-mostly demo API with no cookies/session auth to protect).
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-  next();
-});
+// Any origin is the correct scope, not a shortcut - this is a public read-mostly demo API with no
+// cookies/session auth to protect. Using the standard `cors` package (not hand-rolled headers) -
+// a hand-rolled version worked locally but mysteriously never took effect once deployed on
+// Render, for reasons not fully root-caused; the well-tested package is the safer choice
+// regardless of the exact cause.
+app.use(cors());
 
 app.use(express.json());
 

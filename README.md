@@ -8,8 +8,7 @@ worker-failure recovery, observability, and load-tested benchmarks.
 **Judge0 handles code execution. This project is the distributed system that manages everything
 around execution** — the API, the queue, the workers, the state machine, and the failure handling.
 
-This README is the engineering log, with evidence for every claim. For the resume-bullet /
-60-second-pitch / anticipated-questions version, see [INTERVIEW_PREP.md](INTERVIEW_PREP.md).
+This README is the engineering log, with evidence for every claim.
 
 ## Live demo
 
@@ -189,7 +188,8 @@ to the next — no numbers get claimed until they're actually measured under loa
       k6 - see below for why; the real Judge0 instance's quota deliberately isn't part of this)
 - [x] Phase 11 — deployment topology, a consolidated [failure-mode table](#failure-modes), a
       zero-Judge0-credential quickstart, and this results-first restructure of the README
-- [x] Phase 12 — final resume/interview writeup: see [INTERVIEW_PREP.md](INTERVIEW_PREP.md)
+- [x] Phase 12 — final resume/interview writeup (kept as a local reference document, not published
+      in this repo)
 
 ## Local development
 

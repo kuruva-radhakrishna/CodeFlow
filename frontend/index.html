@@ -116,6 +116,18 @@
   .hidden { display: none; }
   footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; }
   footer a { color: var(--accent); }
+  .points { list-style: none; padding: 0; margin: 14px 0 0; }
+  .points li {
+    padding: 8px 0 8px 22px;
+    position: relative;
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.5;
+    border-top: 1px solid var(--border);
+  }
+  .points li:first-child { border-top: none; }
+  .points li::before { content: '→'; position: absolute; left: 0; color: var(--accent); }
+  .points strong { color: var(--text); }
 </style>
 </head>
 <body>
@@ -128,6 +140,21 @@
       the interesting engineering is in the backend.
       <a href="https://github.com/kuruva-radhakrishna/CodeFlow" target="_blank" rel="noopener">Full write-up →</a>
     </div>
+    <ul class="points">
+      <li><strong>Accepts submissions over a REST API</strong> and durably persists them in
+        PostgreSQL before anything else happens - the API returns as soon as the row is written
+        and the job is queued, not after execution.</li>
+      <li><strong>Distributes execution across a Redis-backed queue</strong> to independently
+        scalable worker processes, each claiming jobs atomically so two workers can never run the
+        same submission twice.</li>
+      <li><strong>Recovers automatically from worker crashes</strong> via leases and heartbeats -
+        an abandoned job is detected and re-queued, not silently lost.</li>
+      <li><strong>Retries transient failures with exponential backoff</strong> (Judge0 5xx,
+        network errors); permanent failures are recorded with a reason, not hidden.</li>
+      <li><strong>Load-tested and benchmarked, not just built</strong>: reached 9.35 jobs/sec at
+        20 concurrent worker lanes in a measured 100-submission test - see the full write-up for
+        the numbers.</li>
+    </ul>
   </header>
 
   <div class="notice">
@@ -197,8 +224,7 @@
 
   <footer>
     API: <a id="apiLink" href="#" target="_blank" rel="noopener"></a> ·
-    <a href="https://github.com/kuruva-radhakrishna/CodeFlow" target="_blank" rel="noopener">Source</a> ·
-    <a href="https://github.com/kuruva-radhakrishna/CodeFlow/blob/main/INTERVIEW_PREP.md" target="_blank" rel="noopener">Interview prep</a>
+    <a href="https://github.com/kuruva-radhakrishna/CodeFlow" target="_blank" rel="noopener">Source</a>
   </footer>
 </div>
 

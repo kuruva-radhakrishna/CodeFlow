@@ -217,6 +217,17 @@
   const runBtn = document.getElementById('run');
   const runStatus = document.getElementById('runStatus');
   const resultPanel = document.getElementById('resultPanel');
+  const sourceEl = document.getElementById('source');
+
+  // Plain <textarea> treats Tab as "move focus to the next element", not "indent" - fine for a
+  // form, wrong for a code editor. Intercept it and insert 4 spaces at the cursor instead.
+  sourceEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    e.preventDefault();
+    const { selectionStart: start, selectionEnd: end, value } = sourceEl;
+    sourceEl.value = value.slice(0, start) + '    ' + value.slice(end);
+    sourceEl.selectionStart = sourceEl.selectionEnd = start + 4;
+  });
 
   function fmtMs(ms) {
     if (ms == null) return '—';

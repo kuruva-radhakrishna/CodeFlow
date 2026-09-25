@@ -11,6 +11,34 @@ around execution** — the API, the queue, the workers, the state machine, and t
 This README is the engineering log, with evidence for every claim. For the resume-bullet /
 60-second-pitch / anticipated-questions version, see [INTERVIEW_PREP.md](INTERVIEW_PREP.md).
 
+## Live demo
+
+- API: **https://codeflow-api-1r33.onrender.com** (e.g. [`/api/v1/health`](https://codeflow-api-1r33.onrender.com/api/v1/health), [`/api/v1/metrics`](https://codeflow-api-1r33.onrender.com/api/v1/metrics))
+- Worker: `codeflow-worker` on Render, running the mock execution provider (Phase 10) - no Judge0
+  credentials involved in this deployment at all.
+
+Both run on Render's **free tier**, which means both **spin down after ~15 minutes of
+inactivity** and take up to 50s to wake on the next request - that's a Render free-tier
+characteristic, not a CodeFlow one (see [Phase 10's benchmark](#verified-2026-09-24-5-vs-10-vs-20-worker-lanes)
+for real throughput numbers, measured with the free-tier cold-start removed from the equation).
+Submit a job and poll its result - if the worker was asleep, the first one will sit `QUEUED`
+noticeably longer than usual while it wakes, then subsequent ones will be fast:
+
+```bash
+curl -X POST https://codeflow-api-1r33.onrender.com/api/v1/submissions \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"you","languageId":71,"sourceCode":"print(\"hello\")","stdin":""}'
+# -> {"submissionId":"sub_...","status":"QUEUED","replayed":false}
+
+curl https://codeflow-api-1r33.onrender.com/api/v1/submissions/<id>/result
+```
+
+Deployed from `v1.0.1` (a small patch on top of the frozen `v1.0.0` - `API_PORT` rename, removed
+an unused Judge0 requirement from the API's config, and an optional health-check listener so the
+worker can run on Render's free Web Service tier instead of the $7/month-minimum paid Background
+Worker type; see that tag's commit for the full reasoning). Both services were verified live,
+end-to-end, against the real Neon/Upstash instances before writing this section down.
+
 ## Results at a glance
 
 What follows is a phase-by-phase engineering log with full evidence for each claim - this section

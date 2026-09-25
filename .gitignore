@@ -8,3 +8,6 @@ dist/
 coverage/
 .DS_Store
 load-tests/results/
+
+# Local-only reference doc, deliberately not published to the public repo
+INTERVIEW_PREP.md
